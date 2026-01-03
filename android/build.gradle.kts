@@ -2,6 +2,14 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+
+        /* ============================================================================
+           CPAPorama (TEMP) - Repo Maven Flutter (io.flutter:* debug/profile/release)
+           - Fix: Could not find io.flutter:x86_64_debug / flutter_embedding_debug
+           - Rollback: supprime juste ce bloc maven { ... }
+           ============================================================================
+        */
+        maven { url = uri("https://storage.googleapis.com/download.flutter.io") }
     }
 }
 
