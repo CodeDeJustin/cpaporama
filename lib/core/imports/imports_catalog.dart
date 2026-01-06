@@ -45,7 +45,10 @@ class ImportsCatalog {
     return DateTime(year, month, day, hour, minute, second);
   }
 
-  static Future<int> computeTotalSeconds(File edfFile, EdxEdfHeader header) async {
+  static Future<int> computeTotalSeconds(
+    File edfFile,
+    EdxEdfHeader header,
+  ) async {
     final bytesPerRecord =
         header.signals.fold<int>(0, (sum, s) => sum + s.samplesPerRecord) * 2;
 
@@ -65,7 +68,10 @@ class ImportsCatalog {
 
     final edfFiles = <File>[];
 
-    await for (final entity in importsDir.list(recursive: true, followLinks: false)) {
+    await for (final entity in importsDir.list(
+      recursive: true,
+      followLinks: false,
+    )) {
       if (entity is File && entity.path.toLowerCase().endsWith('.edf')) {
         edfFiles.add(entity);
       }
@@ -85,7 +91,9 @@ class ImportsCatalog {
         out.add(
           ImportedEdfSummary(
             file: f,
-            fileName: f.uri.pathSegments.isNotEmpty ? f.uri.pathSegments.last : f.path,
+            fileName: f.uri.pathSegments.isNotEmpty
+                ? f.uri.pathSegments.last
+                : f.path,
             numSignals: header.numSignals,
             totalSeconds: totalSeconds,
             start: start,
@@ -96,16 +104,57 @@ class ImportsCatalog {
       }
     }
 
+    // Dédoublonnage: même fileName peut exister via plusieurs sources (SAF/ZIP/etc.)
+    final byName = <String, ImportedEdfSummary>{};
+    final byNameMod = <String, DateTime>{};
+
+    for (final s in out) {
+      final key = s.fileName;
+      final mod = (await s.file.stat()).modified;
+
+      final prev = byName[key];
+      if (prev == null) {
+        byName[key] = s;
+        byNameMod[key] = mod;
+        continue;
+      }
+
+      // Choix: start le plus récent gagne, sinon lastModified le plus récent.
+      final ps = prev.start;
+      final ns = s.start;
+      bool takeNew = false;
+
+      if (ps != null && ns != null) {
+        takeNew = ns.isAfter(ps);
+      } else if (ps == null && ns != null) {
+        takeNew = true;
+      } else if (ps != null && ns == null) {
+        takeNew = false;
+      } else {
+        final prevMod =
+            byNameMod[key] ?? DateTime.fromMillisecondsSinceEpoch(0);
+        takeNew = mod.isAfter(prevMod);
+      }
+
+      if (takeNew) {
+        byName[key] = s;
+        byNameMod[key] = mod;
+      }
+    }
+
+    final deduped = byName.values.toList();
+
     // Tri par date (si disponible), sinon par nom
-    out.sort((a, b) {
+    deduped.sort((a, b) {
       final ad = a.start;
       final bd = b.start;
-      if (ad != null && bd != null) return bd.compareTo(ad); // récent en premier
+      if (ad != null && bd != null)
+        return bd.compareTo(ad); // récent en premier
       if (ad != null) return -1;
       if (bd != null) return 1;
       return a.fileName.compareTo(b.fileName);
     });
 
-    return out;
+    return deduped;
   }
 }

@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../core/parser/edf_header_parser.dart';
@@ -23,7 +24,8 @@ class ImportScreen extends StatefulWidget {
   State<ImportScreen> createState() => _ImportScreenState();
 }
 
-class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver {
+class _ImportScreenState extends State<ImportScreen>
+    with WidgetsBindingObserver {
   String? _pickedFilePath;
 
   String? _edfInfoBase;
@@ -48,6 +50,67 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
   bool _isAutoSyncing = false;
   String _autoStatus = 'Auto-sync: non configuré';
   DateTime? _lastAutoSync;
+
+  String? _pairedTreeUri;
+  String? _autoUserError;
+  bool _autoHadError = false;
+
+  Future<void> _refreshPairing() async {
+    final uri = await ResmedSourcePrefs.getTreeUri();
+    if (!mounted) return;
+    setState(() {
+      _pairedTreeUri = (uri != null && uri.isNotEmpty) ? uri : null;
+    });
+  }
+
+  String _humanizeAutoError(Object e) {
+    // Par défaut, on reste simple.
+    if (e is PlatformException) {
+      final code = e.code;
+      final msg = (e.message ?? '').toLowerCase();
+
+      if (code == 'canceled') return 'Sélection annulée.';
+      if (msg.contains('datalog') &&
+          (msg.contains('introuvable') || msg.contains('manquant'))) {
+        return 'Dossier ResMed introuvable. Sélectionne la racine de la carte SD ou le dossier DATALOG.';
+      }
+      if (msg.contains('tree uri') ||
+          msg.contains('inaccessible') ||
+          msg.contains('permission') ||
+          msg.contains('security')) {
+        return 'Permission perdue ou carte SD non accessible. Reconnecte la carte SD, sinon appuie sur “Oublier la carte SD”.';
+      }
+      if (msg.contains('impossible d\'ouvrir') ||
+          msg.contains('openinputstream')) {
+        return 'Carte SD non détectée. Reconnecte-la puis réessaie.';
+      }
+      if (code == 'sync_failed') {
+        // Fallback propre (au lieu du bruit brut)
+        return 'Synchronisation impossible. Vérifie la carte SD (et que ResMed/DATALOG existe).';
+      }
+    }
+
+    final raw = e.toString();
+    final lower = raw.toLowerCase();
+    if (lower.contains('datalog')) {
+      return 'Dossier ResMed introuvable. Sélectionne la racine de la carte SD ou le dossier DATALOG.';
+    }
+    return 'Erreur de synchronisation. Reconnecte la carte SD, puis réessaie.';
+  }
+
+  Future<void> _forgetSd() async {
+    await ResmedSourcePrefs.clear();
+    if (!mounted) return;
+    setState(() {
+      _pairedTreeUri = null;
+      _autoHadError = false;
+      _autoUserError = null;
+      _autoStatus = 'Carte SD: non connectée';
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Carte SD oubliée. Tu peux reconnecter.')),
+    );
+  }
 
   // Navigation dans le temps
   int _startSeconds = 0;
@@ -102,7 +165,10 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
   String _startLabel(int seconds, {bool withSeconds = false}) {
     final base = _edfStartDateTime;
     if (base == null) return _fmt(seconds);
-    return _fmtClock(base.add(Duration(seconds: seconds)), withSeconds: withSeconds);
+    return _fmtClock(
+      base.add(Duration(seconds: seconds)),
+      withSeconds: withSeconds,
+    );
   }
 
   Future<Directory> _getImportsDir() async {
@@ -209,9 +275,9 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
         ? edfFile.uri.pathSegments.last
         : edfFile.path.split(Platform.pathSeparator).last;
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Prêt: $fileName')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Prêt: $fileName')));
 
     await _reloadSeries();
     await _loadCatalog();
@@ -287,7 +353,7 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
             : chosenEdf.path.split('/').last;
 
         pickedInfoExtra =
-        'ZIP extrait: ${res.extractedFiles} fichiers, ${res.edfFiles.length} EDF\n'
+            'ZIP extrait: ${res.extractedFiles} fichiers, ${res.edfFiles.length} EDF\n'
             'EDF choisi: $chosenName\n'
             '${pick.reason}';
 
@@ -310,9 +376,9 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
       await _loadEdfFile(edfFileCandidate, pickedInfoExtra: pickedInfoExtra);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Erreur import: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Erreur import: $e')));
     }
   }
 
@@ -372,9 +438,9 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
       await _loadEdfFile(bestLocal, pickedInfoExtra: extra);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Import dossier échoué: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Import dossier échoué: $e')));
     }
   }
 
@@ -384,11 +450,21 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
       if (uri == null || uri.isEmpty) return;
       await ResmedSourcePrefs.setTreeUri(uri);
       if (!mounted) return;
-      setState(() => _autoStatus = 'Auto-sync: carte SD autorisée');
+      setState(() {
+        _autoStatus = 'Carte SD: autorisée';
+        _autoHadError = false;
+        _autoUserError = null;
+      });
+      await _refreshPairing();
       await _tryAutoSync();
     } catch (e) {
       if (!mounted) return;
-      setState(() => _autoStatus = 'Auto-sync: erreur pairing ($e)');
+      final msg = _humanizeAutoError(e);
+      setState(() {
+        _autoStatus = 'Carte SD: problème';
+        _autoHadError = true;
+        _autoUserError = msg;
+      });
     }
   }
 
@@ -398,13 +474,20 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
     final treeUri = await ResmedSourcePrefs.getTreeUri();
     if (treeUri == null || treeUri.isEmpty) {
       if (!mounted) return;
-      setState(() => _autoStatus = 'Auto-sync: non configuré (connecte la SD)');
+      setState(() {
+        _autoStatus = 'Carte SD: non connectée';
+        _autoHadError = false;
+        _autoUserError = null;
+      });
+      await _refreshPairing();
       return;
     }
 
     setState(() {
       _isAutoSyncing = true;
-      _autoStatus = 'Auto-sync: recherche de la dernière session…';
+      _autoStatus = 'Synchronisation: en cours…';
+      _autoHadError = false;
+      _autoUserError = null;
     });
 
     try {
@@ -427,8 +510,10 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
       if (!mounted) return;
       setState(() {
         _lastAutoSync = DateTime.now();
-        _autoStatus = 'Auto-sync: OK ($sessionKey) • $copiedCount fichier(s)';
+        _autoStatus = 'Synchronisation: OK • $copiedCount fichier(s)';
         _isAutoSyncing = false;
+        _autoHadError = false;
+        _autoUserError = null;
       });
 
       final extra =
@@ -436,9 +521,12 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
       await _loadEdfFile(File(bestPath), pickedInfoExtra: extra);
     } catch (e) {
       if (!mounted) return;
+      final msg = _humanizeAutoError(e);
       setState(() {
-        _autoStatus = 'Auto-sync: échec (SD absente?) • $e';
+        _autoStatus = 'Synchronisation: échec';
         _isAutoSyncing = false;
+        _autoHadError = true;
+        _autoUserError = msg;
       });
     }
   }
@@ -488,7 +576,7 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
         final endLabel = _startLabel(endSeconds, withSeconds: withSeconds);
 
         _seriesInfo =
-        'Série: ${series.label} | ${sr.toStringAsFixed(1)} Hz | ${series.points.length} pts'
+            'Série: ${series.label} | ${sr.toStringAsFixed(1)} Hz | ${series.points.length} pts'
             ' | $startLabel → $endLabel';
       });
     } catch (e) {
@@ -511,6 +599,7 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
     _isLoadingResmedSessions = true;
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      _refreshPairing();
       _loadCatalog(setLoadingState: false);
       _loadResmedSessions(setLoadingState: false);
       _tryAutoSync();
@@ -534,10 +623,10 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
   Widget build(BuildContext context) {
     final header = _header;
 
-    final windowStart = _edfStartDateTime?.add(Duration(seconds: _startSeconds));
+    final windowStart = _edfStartDateTime?.add(
+      Duration(seconds: _startSeconds),
+    );
     final windowEnd = windowStart?.add(Duration(seconds: _windowSeconds));
-
-
 
     return Scaffold(
       appBar: AppBar(title: const Text('Importer')),
@@ -558,61 +647,110 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
                 const SizedBox(height: 8),
                 const Text(
                   'On copie localement, on lit l’entête EDF, puis on extrait une fenêtre d’un signal.\n'
-                      'Tu peux te déplacer dans la nuit avec “Début”.',
+                  'Tu peux te déplacer dans la nuit avec “Début”.',
                   textAlign: TextAlign.center,
                 ),
 
                 const SizedBox(height: 12),
+
                 Card(
                   child: Padding(
                     padding: const EdgeInsets.all(12),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        Text('Carte SD (auto)', style: Theme.of(context).textTheme.titleMedium),
+                        Text(
+                          'Carte SD',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
                         const SizedBox(height: 6),
                         Text(_autoStatus),
                         if (_lastAutoSync != null) ...[
                           const SizedBox(height: 4),
-                          Text('Dernière synchro: ${_fmtClock(_lastAutoSync!)}'),
+                          Text(
+                            'Dernière synchro: ${_fmtClock(_lastAutoSync!)}',
+                          ),
                         ],
-                        const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: ElevatedButton.icon(
-                                onPressed: _isAutoSyncing ? null : _pairSd,
-                                icon: const Icon(Icons.link),
-                                label: const Text('Connecter la carte SD'),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            IconButton(
-                              onPressed: _isAutoSyncing ? null : _tryAutoSync,
-                              icon: const Icon(Icons.sync),
-                              tooltip: 'Sync',
-                            ),
-                          ],
-                        ),
-                        if (_isAutoSyncing) ...[
+                        if (_autoHadError && _autoUserError != null) ...[
                           const SizedBox(height: 8),
+                          Text(
+                            _autoUserError!,
+                            style: TextStyle(
+                              color: Theme.of(context).colorScheme.error,
+                            ),
+                          ),
+                        ],
+                        const SizedBox(height: 10),
+                        Text(
+                          'Astuce: quand Android te demande un dossier, choisis la racine de la carte SD ou “DATALOG”.',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        const SizedBox(height: 10),
+
+                        // MODE SIMPLE
+                        if (_pairedTreeUri == null) ...[
+                          FilledButton.icon(
+                            onPressed: _isAutoSyncing ? null : _pairSd,
+                            icon: const Icon(Icons.link),
+                            label: const Text('Connecter la carte SD'),
+                          ),
+                        ] else ...[
+                          FilledButton.icon(
+                            onPressed: _isAutoSyncing ? null : _tryAutoSync,
+                            icon: const Icon(Icons.sync),
+                            label: const Text('Synchroniser'),
+                          ),
+                        ],
+
+                        if (_isAutoSyncing) ...[
+                          const SizedBox(height: 10),
                           const LinearProgressIndicator(),
+                        ],
+
+                        if (_pairedTreeUri != null && _autoHadError) ...[
+                          const SizedBox(height: 6),
+                          TextButton.icon(
+                            onPressed: _forgetSd,
+                            icon: const Icon(Icons.link_off),
+                            label: const Text('Oublier la carte SD'),
+                          ),
                         ],
                       ],
                     ),
                   ),
                 ),
 
-                const SizedBox(height: 16),
-                FilledButton(
-                  onPressed: _pickFile,
-                  child: const Text('Choisir un fichier'),
-                ),
                 const SizedBox(height: 12),
-                ElevatedButton.icon(
-                  onPressed: _pickResmedFolder,
-                  icon: const Icon(Icons.folder_open),
-                  label: const Text('Importer dossier ResMed'),
+                ExpansionTile(
+                  title: const Text('Options avancées'),
+                  childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                  children: [
+                    FilledButton(
+                      onPressed: _pickFile,
+                      child: const Text('Choisir un fichier (.edf/.zip)'),
+                    ),
+                    const SizedBox(height: 10),
+                    ElevatedButton.icon(
+                      onPressed: _pickResmedFolder,
+                      icon: const Icon(Icons.folder_open),
+                      label: const Text('Importer dossier ResMed'),
+                    ),
+                    const SizedBox(height: 10),
+                    if (_pairedTreeUri != null)
+                      OutlinedButton.icon(
+                        onPressed: _pairSd,
+                        icon: const Icon(Icons.link),
+                        label: const Text(
+                          'Changer de dossier SD (reconnecter)',
+                        ),
+                      ),
+                    if (_pairedTreeUri != null)
+                      TextButton.icon(
+                        onPressed: _forgetSd,
+                        icon: const Icon(Icons.link_off),
+                        label: const Text('Oublier la carte SD'),
+                      ),
+                  ],
                 ),
 
                 if (_pickedFilePath != null)
@@ -630,7 +768,7 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
                   const SizedBox(height: 8),
                   Text(
                     'Fenêtre: ${_fmtClock(windowStart, withSeconds: _windowSeconds <= 30)}'
-                        ' → ${_fmtClock(windowEnd, withSeconds: _windowSeconds <= 30)}',
+                    ' → ${_fmtClock(windowEnd, withSeconds: _windowSeconds <= 30)}',
                     textAlign: TextAlign.center,
                   ),
                 ],
@@ -696,52 +834,64 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
                   const SizedBox(height: 12),
 
                   // Slider "Début"
-                  Builder(builder: (context) {
-                    final maxStart = max(0, _totalSeconds - _windowSeconds);
-                    final step = 60;
-                    final snapped = (_startSeconds ~/ step) * step;
-                    final current = snapped.clamp(0, maxStart);
+                  Builder(
+                    builder: (context) {
+                      final maxStart = max(0, _totalSeconds - _windowSeconds);
+                      final step = 60;
+                      final snapped = (_startSeconds ~/ step) * step;
+                      final current = snapped.clamp(0, maxStart);
 
-                    final divisions =
-                    maxStart == 0 ? 1 : max(1, (maxStart / step).round());
+                      final divisions = maxStart == 0
+                          ? 1
+                          : max(1, (maxStart / step).round());
 
-                    final labelStart = (_edfStartDateTime == null)
-                        ? _fmt(current)
-                        : _fmtClock(_edfStartDateTime!.add(Duration(seconds: current)));
+                      final labelStart = (_edfStartDateTime == null)
+                          ? _fmt(current)
+                          : _fmtClock(
+                              _edfStartDateTime!.add(
+                                Duration(seconds: current),
+                              ),
+                            );
 
-                    final labelTotal = (_edfStartDateTime == null)
-                        ? _fmt(_totalSeconds)
-                        : _fmtClock(_edfStartDateTime!.add(Duration(seconds: _totalSeconds)));
+                      final labelTotal = (_edfStartDateTime == null)
+                          ? _fmt(_totalSeconds)
+                          : _fmtClock(
+                              _edfStartDateTime!.add(
+                                Duration(seconds: _totalSeconds),
+                              ),
+                            );
 
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Début: $labelStart / $labelTotal',
-                          style: Theme.of(context).textTheme.bodyMedium,
-                        ),
-                        Slider(
-                          value: current.toDouble(),
-                          min: 0,
-                          max: maxStart.toDouble(),
-                          divisions: divisions,
-                          label: labelStart,
-                          onChanged: maxStart == 0
-                              ? null
-                              : (v) {
-                            setState(() {
-                              _startSeconds = ((v / step).round() * step).toInt();
-                            });
-                          },
-                          onChangeEnd: maxStart == 0
-                              ? null
-                              : (_) async {
-                            await _reloadSeries();
-                          },
-                        ),
-                      ],
-                    );
-                  }),
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Début: $labelStart / $labelTotal',
+                            style: Theme.of(context).textTheme.bodyMedium,
+                          ),
+                          Slider(
+                            value: current.toDouble(),
+                            min: 0,
+                            max: maxStart.toDouble(),
+                            divisions: divisions,
+                            label: labelStart,
+                            onChanged: maxStart == 0
+                                ? null
+                                : (v) {
+                                    setState(() {
+                                      _startSeconds =
+                                          ((v / step).round() * step).toInt();
+                                    });
+                                  },
+                            onChangeEnd: maxStart == 0
+                                ? null
+                                : (_) async {
+                                    await _reloadSeries();
+                                  },
+                          ),
+                        ],
+                      );
+                    },
+                  ),
                 ],
 
                 if (_seriesError != null) ...[
@@ -749,7 +899,9 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
                   Text(
                     _seriesError!,
                     textAlign: TextAlign.center,
-                    style: TextStyle(color: Theme.of(context).colorScheme.error),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
                   ),
                 ],
 
@@ -760,9 +912,14 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('Sessions ResMed', style: Theme.of(context).textTheme.titleMedium),
+                    Text(
+                      'Sessions ResMed',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
                     IconButton(
-                      onPressed: _isLoadingResmedSessions ? null : () => _loadResmedSessions(),
+                      onPressed: _isLoadingResmedSessions
+                          ? null
+                          : () => _loadResmedSessions(),
                       icon: const Icon(Icons.refresh),
                       tooltip: 'Rafraîchir',
                     ),
@@ -799,11 +956,18 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
                           try {
                             final extra =
                                 'Session ResMed: ${s.sessionKey}\nTypes: $types\nEDF choisi: ${s.bestType}';
-                            await _loadEdfFile(s.bestFile, pickedInfoExtra: extra);
+                            await _loadEdfFile(
+                              s.bestFile,
+                              pickedInfoExtra: extra,
+                            );
                           } catch (e) {
                             if (!mounted) return;
                             ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text('Impossible de charger la session: $e')),
+                              SnackBar(
+                                content: Text(
+                                  'Impossible de charger la session: $e',
+                                ),
+                              ),
                             );
                           }
                         },
@@ -819,9 +983,14 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('Imports trouvés', style: Theme.of(context).textTheme.titleMedium),
+                    Text(
+                      'Imports trouvés',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
                     IconButton(
-                      onPressed: _isLoadingCatalog ? null : () => _loadCatalog(),
+                      onPressed: _isLoadingCatalog
+                          ? null
+                          : () => _loadCatalog(),
                       icon: const Icon(Icons.refresh),
                       tooltip: 'Rafraîchir',
                     ),
@@ -847,20 +1016,28 @@ class _ImportScreenState extends State<ImportScreen> with WidgetsBindingObserver
                     separatorBuilder: (_, __) => const Divider(height: 1),
                     itemBuilder: (context, i) {
                       final item = _catalog[i];
-                      final when = item.start != null ? _fmtClock(item.start!) : 'date inconnue';
+                      final when = item.start != null
+                          ? _fmtClock(item.start!)
+                          : 'date inconnue';
                       final durMin = (item.totalSeconds / 60).floor();
 
                       return ListTile(
                         dense: true,
                         title: Text(item.fileName),
-                        subtitle: Text('$when • ${durMin} min • ${item.numSignals} signaux'),
+                        subtitle: Text(
+                          '$when • ${durMin} min • ${item.numSignals} signaux',
+                        ),
                         onTap: () async {
                           try {
                             await _loadEdfFile(item.file);
                           } catch (e) {
                             if (!mounted) return;
                             ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text('Impossible de charger cet EDF: $e')),
+                              SnackBar(
+                                content: Text(
+                                  'Impossible de charger cet EDF: $e',
+                                ),
+                              ),
                             );
                           }
                         },

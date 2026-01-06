@@ -3,7 +3,6 @@ package com.example.cpaporama
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
-import android.os.Bundle
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import io.flutter.embedding.android.FlutterActivity
@@ -11,6 +10,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Calendar
 import java.util.Locale
 
 class MainActivity : FlutterActivity() {
@@ -98,15 +98,45 @@ class MainActivity : FlutterActivity() {
         val sessionKey: String,  // YYYYMMDD_HHMMSS
         val startKey: Long,      // yyyymmddhhmmss (numérique)
         val type: String,        // PLD/BRP/...
-        val name: String
+        val name: String,        // filename
+        val nightKey: String     // YYYYMMDD (frontière midi)
     )
+
+    // OSCAR-like: tout ce qui est avant midi appartient à la "nuit" de la veille.
+    private fun nightKeyFrom(ymd: String, hms: String): String {
+        val y = ymd.substring(0, 4).toInt()
+        val m = ymd.substring(4, 6).toInt()
+        val d = ymd.substring(6, 8).toInt()
+        val hh = hms.substring(0, 2).toInt()
+        val mm = hms.substring(2, 4).toInt()
+        val ss = hms.substring(4, 6).toInt()
+
+        val cal = Calendar.getInstance()
+        cal.set(y, m - 1, d, hh, mm, ss)
+        if (hh < 12) cal.add(Calendar.DATE, -1)
+
+        return String.format(
+            Locale.US,
+            "%04d%02d%02d",
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH) + 1,
+            cal.get(Calendar.DAY_OF_MONTH)
+        )
+    }
 
     private fun syncResmedLatest(treeUriStr: String, destBasePath: String, result: MethodChannel.Result) {
         Thread {
             try {
                 val treeUri = Uri.parse(treeUriStr)
+
                 val root = DocumentFile.fromTreeUri(this, treeUri)
                     ?: throw IllegalStateException("Tree URI invalide / inaccessible.")
+
+                // SD absente / pas montée: listFiles souvent vide.
+                val rootFiles = safeListFiles(root)
+                if (rootFiles.isEmpty()) {
+                    throw IllegalStateException("Carte SD non détectée. Reconnecte-la.")
+                }
 
                 val datalog = findDatalogDir(root)
                     ?: throw IllegalStateException("DATALOG introuvable (sélectionne la racine SD ou DATALOG).")
@@ -114,44 +144,89 @@ class MainActivity : FlutterActivity() {
                 val entries = collectEdfs(datalog)
                 if (entries.isEmpty()) throw IllegalStateException("Aucun EDF trouvé dans DATALOG.")
 
-                val newest = entries.maxBy { it.startKey }
-                val sessionKey = newest.sessionKey
-                val sessionEntries = entries.filter { it.sessionKey == sessionKey }
+                // 1) Repère la session la plus récente
+                val newest = entries.maxByOrNull { it.startKey }!!
 
-                val sessionDir = File(destBasePath, "resmed/$sessionKey")
-                sessionDir.mkdirs()
+                // 2) On synchronise la "nuit" associée (frontière midi)
+                val nightKey = newest.nightKey
+                val nightEntries = entries.filter { it.nightKey == nightKey }
+                if (nightEntries.isEmpty()) throw IllegalStateException("Aucun EDF pour la nuit $nightKey.")
 
+                // 3) Choisir le meilleur EDF à ouvrir: type prioritaire, puis le plus gros fichier
                 val priority = listOf("PLD", "BRP", "SA2", "SAD", "CSL", "EVE", "STR")
-                val bestType = priority.firstOrNull { t -> sessionEntries.any { it.type == t } }
-                val chosen = if (bestType != null) sessionEntries.first { it.type == bestType } else sessionEntries.first()
+                val bestType = priority.firstOrNull { t -> nightEntries.any { it.type == t } }
+                val candidates = if (bestType != null) nightEntries.filter { it.type == bestType } else nightEntries
+                val chosen = candidates.maxByOrNull { it.doc.length() } ?: newest
 
                 var copied = 0
                 var bestLocalPath: String? = null
+                val touchedSessions = HashSet<String>()
 
-                for (e in sessionEntries) {
+                // 4) Copie tous les EDF de la nuit dans /imports/resmed/<sessionKey>/
+                for (e in nightEntries) {
+                    val sessionDir = File(destBasePath, "resmed/${e.sessionKey}")
+                    if (!sessionDir.exists()) sessionDir.mkdirs()
+
                     val destFile = File(sessionDir, e.name)
                     copyDocToFile(e.doc.uri, destFile)
+
                     copied++
-                    if (e.name == chosen.name) bestLocalPath = destFile.absolutePath
+                    touchedSessions.add(e.sessionKey)
+
+                    if (e.sessionKey == chosen.sessionKey && e.name == chosen.name) {
+                        bestLocalPath = destFile.absolutePath
+                    }
                 }
 
                 val payload = hashMapOf<String, Any?>(
                     "bestEdfPath" to (bestLocalPath ?: ""),
-                    "sessionKey" to sessionKey,
-                    "copiedCount" to copied
+                    "sessionKey" to "night_$nightKey",
+                    "copiedCount" to copied,
+                    "nightKey" to nightKey,
+                    "sessionsCount" to touchedSessions.size,
+                    "newestSessionKey" to newest.sessionKey
                 )
 
                 runOnUiThread { result.success(payload) }
             } catch (t: Throwable) {
                 Log.e("CPAPorama", "syncResmedLatest error", t)
-                runOnUiThread { result.error("sync_failed", t.message ?: "Erreur inconnue", null) }
+
+                val (code, msg) = mapError(t)
+                runOnUiThread { result.error(code, msg, null) }
             }
         }.start()
     }
 
+    private fun mapError(t: Throwable): Pair<String, String> {
+        // Codes stables côté Flutter
+        val msg = t.message ?: "Erreur inconnue"
+
+        // SecurityException / permissions
+        if (t is SecurityException) {
+            return "permission_lost" to "Permission perdue. Reconnecte la carte SD (ou reconnecte via Connecter)."
+        }
+
+        val low = msg.lowercase(Locale.US)
+        return when {
+            low.contains("carte sd non détectée") || low.contains("non détectée") ->
+                "sd_missing" to "Carte SD non détectée. Reconnecte-la."
+
+            low.contains("datalog introuvable") || low.contains("datalog") && low.contains("introuvable") ->
+                "datalog_missing" to "Dossier ResMed introuvable. Sélectionne la racine SD ou le dossier DATALOG."
+
+            low.contains("tree uri invalide") || low.contains("inaccessible") || low.contains("permission") ->
+                "permission_lost" to "Permission perdue ou dossier inaccessible. Reconnecte la carte SD."
+
+            else ->
+                "sync_failed" to msg
+        }
+    }
+
     private fun findDatalogDir(root: DocumentFile): DocumentFile? {
         if (root.isDirectory && root.name?.equals("DATALOG", ignoreCase = true) == true) return root
-        return root.listFiles().firstOrNull { it.isDirectory && it.name?.equals("DATALOG", ignoreCase = true) == true }
+        return safeListFiles(root).firstOrNull {
+            it.isDirectory && it.name?.equals("DATALOG", ignoreCase = true) == true
+        }
     }
 
     private fun collectEdfs(datalog: DocumentFile): List<Entry> {
@@ -163,7 +238,7 @@ class MainActivity : FlutterActivity() {
 
         while (stack.isNotEmpty()) {
             val dir = stack.removeFirst()
-            for (child in dir.listFiles()) {
+            for (child in safeListFiles(dir)) {
                 if (child.isDirectory) {
                     stack.add(child)
                     continue
@@ -176,14 +251,25 @@ class MainActivity : FlutterActivity() {
                 val type = m.groupValues[3].uppercase(Locale.US)
                 val sessionKey = "${ymd}_${hms}"
                 val startKey = (ymd + hms).toLongOrNull() ?: 0L
+                val nightKey = nightKeyFrom(ymd, hms)
 
-                out.add(Entry(child, sessionKey, startKey, type, name))
+                out.add(Entry(child, sessionKey, startKey, type, name, nightKey))
             }
         }
         return out
     }
 
+    private fun safeListFiles(dir: DocumentFile): Array<DocumentFile> {
+        return try {
+            dir.listFiles()
+        } catch (t: Throwable) {
+            emptyArray()
+        }
+    }
+
     private fun copyDocToFile(uri: Uri, destFile: File) {
+        destFile.parentFile?.mkdirs()
+
         contentResolver.openInputStream(uri).use { input ->
             if (input == null) throw IllegalStateException("Impossible d'ouvrir: $uri")
             FileOutputStream(destFile).use { output ->
@@ -198,9 +284,3 @@ class MainActivity : FlutterActivity() {
         }
     }
 }
-
-//package com.example.cpaporama
-//
-//import io.flutter.embedding.android.FlutterActivity
-//
-//class MainActivity : FlutterActivity()
