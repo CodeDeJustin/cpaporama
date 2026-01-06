@@ -1,4 +1,7 @@
 import 'dart:io';
+import 'dart:math';
+
+import '../parser/edf_header_parser.dart';
 
 class ResmedSessionSummary {
   ResmedSessionSummary({
@@ -7,6 +10,7 @@ class ResmedSessionSummary {
     required this.types,
     required this.bestFile,
     required this.bestType,
+    required this.totalSeconds,
   });
 
   final String sessionKey; // YYYYMMDD_HHMMSS
@@ -14,6 +18,12 @@ class ResmedSessionSummary {
   final List<String> types; // ex: [BRP, PLD, SA2]
   final File bestFile;
   final String bestType;
+
+  /// Durée estimée (seconds) basée sur le bestFile (souvent PLD).
+  final int? totalSeconds;
+
+  DateTime? get end =>
+      totalSeconds == null ? null : start.add(Duration(seconds: totalSeconds!));
 }
 
 class _Entry {
@@ -59,6 +69,28 @@ class ResmedSessionCatalog {
     return DateTime(y!, m!, d!, hh!, mm!, ss!);
   }
 
+  static Future<int?> _estimateTotalSeconds(File edfFile) async {
+    try {
+      final header = await EdfHeaderParser.parseHeader(edfFile);
+
+      final bytesPerRecord =
+          header.signals.fold<int>(0, (sum, s) => sum + s.samplesPerRecord) * 2;
+
+      final fileLen = await edfFile.length();
+      final dataBytes = fileLen - header.headerBytes;
+      final computedRecords = dataBytes > 0 ? (dataBytes ~/ bytesPerRecord) : 0;
+
+      final totalRecords = header.numRecords > 0
+          ? min(header.numRecords, computedRecords)
+          : computedRecords;
+
+      final totalSeconds = (totalRecords * header.recordDurationSeconds).floor();
+      return totalSeconds > 0 ? totalSeconds : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<List<ResmedSessionSummary>> scan(Directory root) async {
     if (!await root.exists()) return [];
 
@@ -80,7 +112,9 @@ class ResmedSessionCatalog {
       if (start == null) continue;
 
       final sessionKey = '${date}_$time';
-      entries.add(_Entry(file: ent, start: start, type: type, sessionKey: sessionKey));
+      entries.add(
+        _Entry(file: ent, start: start, type: type, sessionKey: sessionKey),
+      );
     }
 
     if (entries.isEmpty) return [];
@@ -97,7 +131,6 @@ class ResmedSessionCatalog {
       final sessionKey = kv.key;
       final list = kv.value;
 
-      // start: toutes les entrées d'une session ont la même start
       final start = list.first.start;
 
       final typesSet = list.map((e) => e.type).toSet();
@@ -116,6 +149,9 @@ class ResmedSessionCatalog {
         }
       }
 
+      // Durée: basée sur le bestFile (souvent PLD). Si c'est CSL/EVE seulement, ça peut rester null.
+      final totalSeconds = await _estimateTotalSeconds(chosen.file);
+
       summaries.add(
         ResmedSessionSummary(
           sessionKey: sessionKey,
@@ -123,6 +159,7 @@ class ResmedSessionCatalog {
           types: types,
           bestFile: chosen.file,
           bestType: chosenType,
+          totalSeconds: totalSeconds,
         ),
       );
     }

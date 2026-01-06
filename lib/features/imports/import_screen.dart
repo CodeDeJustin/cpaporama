@@ -12,7 +12,8 @@ import '../../core/imports/zip_extractor.dart';
 import '../../core/imports/imports_catalog.dart';
 import '../../core/imports/resmed_datalog_picker.dart';
 import '../../core/imports/resmed_sd_scanner.dart';
-import '../../core/imports/resmed_session_catalog.dart';
+import '../../core/imports/resmed_night_catalog.dart';
+import '../nights/resmed_night_details_screen.dart';
 import '../../core/imports/resmed_source_prefs.dart';
 import '../../core/imports/resmed_saf_bridge.dart';
 import '../charts/simple_line_chart.dart';
@@ -44,8 +45,8 @@ class _ImportScreenState extends State<ImportScreen>
   List<ImportedEdfSummary> _catalog = [];
   bool _isLoadingCatalog = false;
 
-  List<ResmedSessionSummary> _resmedSessions = [];
-  bool _isLoadingResmedSessions = false;
+  List<ResmedNightSummary> _resmedNights = [];
+  bool _isLoadingResmedNights = false;
 
   bool _isAutoSyncing = false;
   String _autoStatus = 'Auto-sync: non configuré';
@@ -196,23 +197,23 @@ class _ImportScreenState extends State<ImportScreen>
     }
   }
 
-  Future<void> _loadResmedSessions({bool setLoadingState = true}) async {
+  Future<void> _loadResmedNights({bool setLoadingState = true}) async {
     if (setLoadingState) {
-      setState(() => _isLoadingResmedSessions = true);
+      setState(() => _isLoadingResmedNights = true);
     }
 
     try {
       final dir = await _getImportsDir();
-      final sessions = await ResmedSessionCatalog.scan(dir);
+      final nights = await ResmedNightCatalog.scan(dir);
 
       if (!mounted) return;
       setState(() {
-        _resmedSessions = sessions;
-        _isLoadingResmedSessions = false;
+        _resmedNights = nights;
+        _isLoadingResmedNights = false;
       });
     } catch (_) {
       if (!mounted) return;
-      setState(() => _isLoadingResmedSessions = false);
+      setState(() => _isLoadingResmedNights = false);
     }
   }
 
@@ -281,7 +282,7 @@ class _ImportScreenState extends State<ImportScreen>
 
     await _reloadSeries();
     await _loadCatalog();
-    await _loadResmedSessions(setLoadingState: false);
+    await _loadResmedNights(setLoadingState: false);
   }
 
   Future<void> _pickFile() async {
@@ -596,12 +597,12 @@ class _ImportScreenState extends State<ImportScreen>
     WidgetsBinding.instance.addObserver(this);
 
     _isLoadingCatalog = true;
-    _isLoadingResmedSessions = true;
+    _isLoadingResmedNights = true;
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _refreshPairing();
       _loadCatalog(setLoadingState: false);
-      _loadResmedSessions(setLoadingState: false);
+      _loadResmedNights(setLoadingState: false);
       _tryAutoSync();
     });
   }
@@ -912,62 +913,61 @@ class _ImportScreenState extends State<ImportScreen>
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      'Sessions ResMed',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
+                    Text('Nuits ResMed', style: Theme.of(context).textTheme.titleMedium),
                     IconButton(
-                      onPressed: _isLoadingResmedSessions
-                          ? null
-                          : () => _loadResmedSessions(),
+                      onPressed: _isLoadingResmedNights ? null : () => _loadResmedNights(),
                       icon: const Icon(Icons.refresh),
                       tooltip: 'Rafraîchir',
                     ),
                   ],
                 ),
 
-                if (_isLoadingResmedSessions) ...[
+                if (_isLoadingResmedNights) ...[
                   const SizedBox(height: 8),
                   const LinearProgressIndicator(),
                 ],
 
-                if (_resmedSessions.isEmpty && !_isLoadingResmedSessions) ...[
+                if (_resmedNights.isEmpty && !_isLoadingResmedNights) ...[
                   const SizedBox(height: 8),
-                  const Text('Aucune session ResMed détectée dans imports/.'),
+                  const Text('Aucune nuit ResMed détectée dans imports/.'),
                 ],
 
-                if (_resmedSessions.isNotEmpty) ...[
+                if (_resmedNights.isNotEmpty) ...[
                   const SizedBox(height: 8),
                   ListView.separated(
                     shrinkWrap: true,
                     physics: const NeverScrollableScrollPhysics(),
-                    itemCount: _resmedSessions.length,
+                    itemCount: _resmedNights.length,
                     separatorBuilder: (_, __) => const Divider(height: 1),
                     itemBuilder: (context, i) {
-                      final s = _resmedSessions[i];
-                      final when = '${_fmtDate(s.start)} ${_fmtClock(s.start)}';
-                      final types = s.types.join(', ');
+                      final n = _resmedNights[i];
+                      final date = _fmtDate(n.nightDate);
+                      final start = _fmtClock(n.start);
+                      final end = _fmtClock(n.end);
 
                       return ListTile(
                         dense: true,
-                        title: Text('$when • ${s.sessionKey}'),
-                        subtitle: Text('Types: $types • Choix: ${s.bestType}'),
+                        leading: const Icon(Icons.nightlight_round),
+                        title: Text('$date • ${n.segmentsCount} segment(s)'),
+                        subtitle: Text('Fenêtre: $start → $end'),
                         onTap: () async {
                           try {
-                            final extra =
-                                'Session ResMed: ${s.sessionKey}\nTypes: $types\nEDF choisi: ${s.bestType}';
-                            await _loadEdfFile(
-                              s.bestFile,
-                              pickedInfoExtra: extra,
+                            final file = await Navigator.push<File?>(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => ResmedNightDetailsScreen(night: n),
+                              ),
                             );
+
+                            if (file == null) return;
+
+                            final extra =
+                                'Nuit ResMed: $date\nSegments: ${n.segmentsCount}\nSource: imports/resmed';
+                            await _loadEdfFile(file, pickedInfoExtra: extra);
                           } catch (e) {
                             if (!mounted) return;
                             ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text(
-                                  'Impossible de charger la session: $e',
-                                ),
-                              ),
+                              SnackBar(content: Text('Impossible d’ouvrir la nuit: $e')),
                             );
                           }
                         },
