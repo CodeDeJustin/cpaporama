@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/imports/resmed_night_catalog.dart';
 import '../../core/parser/edf_header_parser.dart';
+import 'night_viewer_screen.dart';
 
 class ResmedNightDetailsScreen extends StatefulWidget {
   const ResmedNightDetailsScreen({
@@ -108,6 +109,19 @@ class _ResmedNightDetailsScreenState extends State<ResmedNightDetailsScreen> {
                     onPressed: () => Navigator.pop<File>(context, primary.bestFile),
                     icon: const Icon(Icons.play_arrow),
                     label: const Text('Ouvrir le segment principal'),
+                  ),
+                  const SizedBox(height: 10),
+                  FilledButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => NightViewerScreen(night: night),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.nightlight_round),
+                    label: const Text('Ouvrir la nuit complète'),
                   ),
                   if (_loadingDurations) ...[
                     const SizedBox(height: 10),

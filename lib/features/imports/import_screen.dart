@@ -13,7 +13,7 @@ import '../../core/imports/imports_catalog.dart';
 import '../../core/imports/resmed_datalog_picker.dart';
 import '../../core/imports/resmed_sd_scanner.dart';
 import '../../core/imports/resmed_night_catalog.dart';
-import '../nights/resmed_night_details_screen.dart';
+import '../nights/night_viewer_screen.dart';
 import '../../core/imports/resmed_source_prefs.dart';
 import '../../core/imports/resmed_saf_bridge.dart';
 import '../charts/simple_line_chart.dart';
@@ -38,6 +38,7 @@ class _ImportScreenState extends State<ImportScreen>
 
   EdfSignalSeries? _series;
   String? _seriesError;
+  String? _lastAutoOpenedSessionKey;
 
   int? _selectedSignalIndex;
   int _windowSeconds = 30;
@@ -51,6 +52,7 @@ class _ImportScreenState extends State<ImportScreen>
   bool _isAutoSyncing = false;
   String _autoStatus = 'Auto-sync: non configuré';
   DateTime? _lastAutoSync;
+  DateTime? _lastAutoSyncAttempt; // dernière tentative (succès ou échec)
 
   String? _pairedTreeUri;
   String? _autoUserError;
@@ -107,6 +109,9 @@ class _ImportScreenState extends State<ImportScreen>
       _autoHadError = false;
       _autoUserError = null;
       _autoStatus = 'Carte SD: non connectée';
+      _lastAutoOpenedSessionKey = null;
+      _lastAutoSync = null;
+      _lastAutoSyncAttempt = null;
     });
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Carte SD oubliée. Tu peux reconnecter.')),
@@ -161,6 +166,34 @@ class _ImportScreenState extends State<ImportScreen>
     final m = dt.month.toString().padLeft(2, '0');
     final d = dt.day.toString().padLeft(2, '0');
     return '$y-$m-$d';
+  }
+
+  void _openNightViewer(ResmedNightSummary night) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => NightViewerScreen(night: night)),
+      );
+    });
+  }
+
+  ResmedNightSummary? _findNightFromSessionKey(String sessionKey) {
+    // sessionKey typique: "night_20260108" → on extrait 20260108
+    final m = RegExp(r'(\d{8})').firstMatch(sessionKey);
+    if (m == null) return null;
+
+    final s = m.group(1)!;
+    final y = int.parse(s.substring(0, 4));
+    final mo = int.parse(s.substring(4, 6));
+    final d = int.parse(s.substring(6, 8));
+    final target = DateTime(y, mo, d);
+
+    for (final n in _resmedNights) {
+      final nd = DateTime(n.nightDate.year, n.nightDate.month, n.nightDate.day);
+      if (nd == target) return n;
+    }
+    return null;
   }
 
   String _startLabel(int seconds, {bool withSeconds = false}) {
@@ -428,6 +461,7 @@ class _ImportScreenState extends State<ImportScreen>
         ),
       );
 
+      // ✅ AJOUT: info + chargement du EDF local (comme avant)
       final extra =
           'Import ResMed (dossier)\n'
           'Session: $sessionKey\n'
@@ -439,9 +473,9 @@ class _ImportScreenState extends State<ImportScreen>
       await _loadEdfFile(bestLocal, pickedInfoExtra: extra);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Import dossier échoué: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Import dossier échoué: $e')),
+      );
     }
   }
 
@@ -457,7 +491,7 @@ class _ImportScreenState extends State<ImportScreen>
         _autoUserError = null;
       });
       await _refreshPairing();
-      await _tryAutoSync();
+      await _tryAutoSync(force: true);
     } catch (e) {
       if (!mounted) return;
       final msg = _humanizeAutoError(e);
@@ -469,8 +503,24 @@ class _ImportScreenState extends State<ImportScreen>
     }
   }
 
-  Future<void> _tryAutoSync() async {
+  Future<void> _tryAutoSync({bool force = false}) async {
     if (_isAutoSyncing) return;
+
+    // ✅ Garde: si ImportScreen n'est pas l'écran visible, on ne lance PAS d'auto-sync.
+    // IMPORTANT: ne bloque pas le bouton "Synchroniser" (force=true).
+    if (!force) {
+      final isCurrent = ModalRoute.of(context)?.isCurrent ?? true;
+      if (!isCurrent) return;
+    }
+
+    // Anti "resume spam" : limite les tentatives automatiques.
+    // IMPORTANT: ne bloque pas le bouton "Synchroniser" quand force=true.
+    final now = DateTime.now();
+    final lastAttempt = _lastAutoSyncAttempt;
+    if (!force && lastAttempt != null && now.difference(lastAttempt).inSeconds < 60) {
+      return;
+    }
+    _lastAutoSyncAttempt = now;
 
     final treeUri = await ResmedSourcePrefs.getTreeUri();
     if (treeUri == null || treeUri.isEmpty) {
@@ -484,6 +534,7 @@ class _ImportScreenState extends State<ImportScreen>
       return;
     }
 
+    if (!mounted) return;
     setState(() {
       _isAutoSyncing = true;
       _autoStatus = 'Synchronisation: en cours…';
@@ -502,12 +553,15 @@ class _ImportScreenState extends State<ImportScreen>
         destBasePath: importsDir.path,
       );
 
-      final bestPath = (res['bestEdfPath'] as String?) ?? '';
       final sessionKey = (res['sessionKey'] as String?) ?? 'unknown';
       final copiedCount = (res['copiedCount'] as int?) ?? 0;
 
-      if (bestPath.isEmpty) throw Exception('bestEdfPath vide');
+      if (copiedCount <= 0) throw Exception('Aucun fichier copié');
 
+      // 1) Rafraîchir la liste des nuits après copie
+      await _loadResmedNights(setLoadingState: false);
+
+      // 2) Mettre à jour l'état UI
       if (!mounted) return;
       setState(() {
         _lastAutoSync = DateTime.now();
@@ -517,9 +571,44 @@ class _ImportScreenState extends State<ImportScreen>
         _autoUserError = null;
       });
 
-      final extra =
-          'Auto-sync SD\nSession: $sessionKey\nCopié: $copiedCount fichier(s)\nSource: SAF';
-      await _loadEdfFile(File(bestPath), pickedInfoExtra: extra);
+      // 3) Auto-ouvrir la nuit complète (une seule fois par session)
+      if (sessionKey.isEmpty) return;
+      if (sessionKey == _lastAutoOpenedSessionKey) return;
+      _lastAutoOpenedSessionKey = sessionKey;
+
+      // Fallback: plus récente nuit (si jamais la date ne match pas)
+      ResmedNightSummary? fallback;
+      if (_resmedNights.isNotEmpty) {
+        final sorted = _resmedNights.toList()
+          ..sort((a, b) => b.nightDate.compareTo(a.nightDate));
+        fallback = sorted.first;
+      }
+
+      final night = _findNightFromSessionKey(sessionKey) ?? fallback;
+      if (night == null) return;
+
+      // Optionnel: vider le mini-viewer EDF pour éviter confusion
+      if (mounted) {
+        setState(() {
+          _pickedFilePath = null;
+          _edfInfoBase = null;
+          _seriesInfo = null;
+          _copiedFile = null;
+          _header = null;
+          _series = null;
+          _seriesError = null;
+          _edfStartDateTime = null;
+          _startSeconds = 0;
+          _totalSeconds = 0;
+        });
+      }
+
+      // ✅ Garde: si l'utilisateur n'est plus sur ImportScreen, on ne push pas un écran par-dessus.
+      // (Ex: synchro démarre, il ouvre une nuit, synchro finit et tente de repush.)
+      final canNavigate = ModalRoute.of(context)?.isCurrent ?? true;
+      if (canNavigate) {
+        _openNightViewer(night);
+      }
     } catch (e) {
       if (!mounted) return;
       final msg = _humanizeAutoError(e);
@@ -616,7 +705,8 @@ class _ImportScreenState extends State<ImportScreen>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _tryAutoSync();
+      final isCurrent = ModalRoute.of(context)?.isCurrent ?? true;
+      if (isCurrent) _tryAutoSync();
     }
   }
 
@@ -697,7 +787,7 @@ class _ImportScreenState extends State<ImportScreen>
                           ),
                         ] else ...[
                           FilledButton.icon(
-                            onPressed: _isAutoSyncing ? null : _tryAutoSync,
+                            onPressed: _isAutoSyncing ? null : () => _tryAutoSync(force: true),
                             icon: const Icon(Icons.sync),
                             label: const Text('Synchroniser'),
                           ),
@@ -950,26 +1040,13 @@ class _ImportScreenState extends State<ImportScreen>
                         leading: const Icon(Icons.nightlight_round),
                         title: Text('$date • ${n.segmentsCount} segment(s)'),
                         subtitle: Text('Fenêtre: $start → $end'),
-                        onTap: () async {
-                          try {
-                            final file = await Navigator.push<File?>(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => ResmedNightDetailsScreen(night: n),
-                              ),
-                            );
-
-                            if (file == null) return;
-
-                            final extra =
-                                'Nuit ResMed: $date\nSegments: ${n.segmentsCount}\nSource: imports/resmed';
-                            await _loadEdfFile(file, pickedInfoExtra: extra);
-                          } catch (e) {
-                            if (!mounted) return;
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text('Impossible d’ouvrir la nuit: $e')),
-                            );
-                          }
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => NightViewerScreen(night: n),
+                            ),
+                          );
                         },
                       );
                     },
