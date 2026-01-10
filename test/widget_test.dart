@@ -4,9 +4,9 @@ import 'package:cpaporama/app/cpaporama_app.dart';
 
 void main() {
   testWidgets('L’app démarre', (WidgetTester tester) async {
-    await tester.pumpWidget(const CpapOramaApp());
+    await tester.pumpWidget(const CpaporamaApp());
 
     // Smoke test: si ça rend sans exception, c’est déjà une victoire.
-    expect(find.byType(CpapOramaApp), findsOneWidget);
+    expect(find.byType(CpaporamaApp), findsOneWidget);
   });
 }

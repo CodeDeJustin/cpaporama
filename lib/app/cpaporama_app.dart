@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:cpaporama/features/home/home_screen.dart';
 
-import '../features/imports/import_screen.dart';
-
-class CpapOramaApp extends StatelessWidget {
-  const CpapOramaApp({super.key});
+class CpaporamaApp extends StatelessWidget {
+  const CpaporamaApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -14,7 +13,7 @@ class CpapOramaApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3576E2)),
         useMaterial3: true,
       ),
-      home: const ImportScreen(),
+      home: const HomeScreen(),
     );
   }
 }

@@ -19,7 +19,18 @@ import '../../core/imports/resmed_saf_bridge.dart';
 import '../charts/simple_line_chart.dart';
 
 class ImportScreen extends StatefulWidget {
-  const ImportScreen({super.key});
+  const ImportScreen({
+    super.key,
+    this.appBarTitle = 'Importer',
+    this.enableAutoSync = true,
+    this.showSdCard = true,
+    this.showResmedNights = true,
+  });
+
+  final String appBarTitle;
+  final bool enableAutoSync;
+  final bool showSdCard;
+  final bool showResmedNights;
 
   @override
   State<ImportScreen> createState() => _ImportScreenState();
@@ -473,9 +484,9 @@ class _ImportScreenState extends State<ImportScreen>
       await _loadEdfFile(bestLocal, pickedInfoExtra: extra);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Import dossier échoué: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Import dossier échoué: $e')));
     }
   }
 
@@ -517,7 +528,9 @@ class _ImportScreenState extends State<ImportScreen>
     // IMPORTANT: ne bloque pas le bouton "Synchroniser" quand force=true.
     final now = DateTime.now();
     final lastAttempt = _lastAutoSyncAttempt;
-    if (!force && lastAttempt != null && now.difference(lastAttempt).inSeconds < 60) {
+    if (!force &&
+        lastAttempt != null &&
+        now.difference(lastAttempt).inSeconds < 60) {
       return;
     }
     _lastAutoSyncAttempt = now;
@@ -686,13 +699,20 @@ class _ImportScreenState extends State<ImportScreen>
     WidgetsBinding.instance.addObserver(this);
 
     _isLoadingCatalog = true;
-    _isLoadingResmedNights = true;
+    _isLoadingResmedNights = widget.showResmedNights || widget.enableAutoSync;
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _refreshPairing();
       _loadCatalog(setLoadingState: false);
-      _loadResmedNights(setLoadingState: false);
-      _tryAutoSync();
+
+      final needNights = widget.showResmedNights || widget.enableAutoSync;
+      if (needNights) {
+        _loadResmedNights(setLoadingState: false);
+      }
+
+      if (widget.enableAutoSync) {
+        _tryAutoSync();
+      }
     });
   }
 
@@ -704,7 +724,7 @@ class _ImportScreenState extends State<ImportScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
+    if (state == AppLifecycleState.resumed && widget.enableAutoSync) {
       final isCurrent = ModalRoute.of(context)?.isCurrent ?? true;
       if (isCurrent) _tryAutoSync();
     }
@@ -720,7 +740,7 @@ class _ImportScreenState extends State<ImportScreen>
     final windowEnd = windowStart?.add(Duration(seconds: _windowSeconds));
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Importer')),
+      appBar: AppBar(title: Text(widget.appBarTitle)),
       body: SingleChildScrollView(
         child: Center(
           child: Padding(
@@ -731,7 +751,7 @@ class _ImportScreenState extends State<ImportScreen>
                 const Icon(Icons.sd_card, size: 56),
                 const SizedBox(height: 16),
                 Text(
-                  'Import v0.2.4 (début + fenêtre)',
+                  'v0.2.7',
                   style: Theme.of(context).textTheme.titleLarge,
                   textAlign: TextAlign.center,
                 ),
@@ -744,72 +764,76 @@ class _ImportScreenState extends State<ImportScreen>
 
                 const SizedBox(height: 12),
 
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Text(
-                          'Carte SD',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                        const SizedBox(height: 6),
-                        Text(_autoStatus),
-                        if (_lastAutoSync != null) ...[
-                          const SizedBox(height: 4),
+                if (widget.showSdCard) ...[
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
                           Text(
-                            'Dernière synchro: ${_fmtClock(_lastAutoSync!)}',
+                            'Carte SD',
+                            style: Theme.of(context).textTheme.titleMedium,
                           ),
-                        ],
-                        if (_autoHadError && _autoUserError != null) ...[
-                          const SizedBox(height: 8),
-                          Text(
-                            _autoUserError!,
-                            style: TextStyle(
-                              color: Theme.of(context).colorScheme.error,
-                            ),
-                          ),
-                        ],
-                        const SizedBox(height: 10),
-                        Text(
-                          'Astuce: quand Android te demande un dossier, choisis la racine de la carte SD ou “DATALOG”.',
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                        const SizedBox(height: 10),
-
-                        // MODE SIMPLE
-                        if (_pairedTreeUri == null) ...[
-                          FilledButton.icon(
-                            onPressed: _isAutoSyncing ? null : _pairSd,
-                            icon: const Icon(Icons.link),
-                            label: const Text('Connecter la carte SD'),
-                          ),
-                        ] else ...[
-                          FilledButton.icon(
-                            onPressed: _isAutoSyncing ? null : () => _tryAutoSync(force: true),
-                            icon: const Icon(Icons.sync),
-                            label: const Text('Synchroniser'),
-                          ),
-                        ],
-
-                        if (_isAutoSyncing) ...[
-                          const SizedBox(height: 10),
-                          const LinearProgressIndicator(),
-                        ],
-
-                        if (_pairedTreeUri != null && _autoHadError) ...[
                           const SizedBox(height: 6),
-                          TextButton.icon(
-                            onPressed: _forgetSd,
-                            icon: const Icon(Icons.link_off),
-                            label: const Text('Oublier la carte SD'),
+                          Text(_autoStatus),
+                          if (_lastAutoSync != null) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              'Dernière synchro: ${_fmtClock(_lastAutoSync!)}',
+                            ),
+                          ],
+                          if (_autoHadError && _autoUserError != null) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              _autoUserError!,
+                              style: TextStyle(
+                                color: Theme.of(context).colorScheme.error,
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 10),
+                          Text(
+                            'Astuce: quand Android te demande un dossier, choisis la racine de la carte SD ou “DATALOG”.',
+                            style: Theme.of(context).textTheme.bodySmall,
                           ),
+                          const SizedBox(height: 10),
+
+                          // MODE SIMPLE
+                          if (_pairedTreeUri == null) ...[
+                            FilledButton.icon(
+                              onPressed: _isAutoSyncing ? null : _pairSd,
+                              icon: const Icon(Icons.link),
+                              label: const Text('Connecter la carte SD'),
+                            ),
+                          ] else ...[
+                            FilledButton.icon(
+                              onPressed: _isAutoSyncing
+                                  ? null
+                                  : () => _tryAutoSync(force: true),
+                              icon: const Icon(Icons.sync),
+                              label: const Text('Synchroniser'),
+                            ),
+                          ],
+
+                          if (_isAutoSyncing) ...[
+                            const SizedBox(height: 10),
+                            const LinearProgressIndicator(),
+                          ],
+
+                          if (_pairedTreeUri != null && _autoHadError) ...[
+                            const SizedBox(height: 6),
+                            TextButton.icon(
+                              onPressed: _forgetSd,
+                              icon: const Icon(Icons.link_off),
+                              label: const Text('Oublier la carte SD'),
+                            ),
+                          ],
                         ],
-                      ],
+                      ),
                     ),
                   ),
-                ),
+                ],
 
                 const SizedBox(height: 12),
                 ExpansionTile(
@@ -827,20 +851,23 @@ class _ImportScreenState extends State<ImportScreen>
                       label: const Text('Importer dossier ResMed'),
                     ),
                     const SizedBox(height: 10),
-                    if (_pairedTreeUri != null)
-                      OutlinedButton.icon(
-                        onPressed: _pairSd,
-                        icon: const Icon(Icons.link),
-                        label: const Text(
-                          'Changer de dossier SD (reconnecter)',
+
+                    if (widget.showSdCard) ...[
+                      if (_pairedTreeUri != null)
+                        OutlinedButton.icon(
+                          onPressed: _pairSd,
+                          icon: const Icon(Icons.link),
+                          label: const Text(
+                            'Changer de dossier SD (reconnecter)',
+                          ),
                         ),
-                      ),
-                    if (_pairedTreeUri != null)
-                      TextButton.icon(
-                        onPressed: _forgetSd,
-                        icon: const Icon(Icons.link_off),
-                        label: const Text('Oublier la carte SD'),
-                      ),
+                      if (_pairedTreeUri != null)
+                        TextButton.icon(
+                          onPressed: _forgetSd,
+                          icon: const Icon(Icons.link_off),
+                          label: const Text('Oublier la carte SD'),
+                        ),
+                    ],
                   ],
                 ),
 
@@ -1003,7 +1030,10 @@ class _ImportScreenState extends State<ImportScreen>
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('Nuits ResMed', style: Theme.of(context).textTheme.titleMedium),
+                    Text(
+                      'Nuits ResMed',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
                     IconButton(
                       onPressed: _isLoadingResmedNights ? null : () => _loadResmedNights(),
                       icon: const Icon(Icons.refresh),
@@ -1043,9 +1073,7 @@ class _ImportScreenState extends State<ImportScreen>
                         onTap: () {
                           Navigator.push(
                             context,
-                            MaterialPageRoute(
-                              builder: (_) => NightViewerScreen(night: n),
-                            ),
+                            MaterialPageRoute(builder: (_) => NightViewerScreen(night: n)),
                           );
                         },
                       );
