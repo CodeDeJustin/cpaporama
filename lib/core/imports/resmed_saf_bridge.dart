@@ -15,9 +15,39 @@ class ResmedSafBridge {
       'syncResmedLatest',
       {'treeUri': treeUri, 'destBasePath': destBasePath},
     );
-    if (res == null) {
-      throw Exception('Réponse native nulle (syncResmedLatest).');
-    }
+    if (res == null) throw Exception('Réponse native nulle (syncResmedLatest).');
+    return res;
+  }
+
+  static Future<Map<String, dynamic>> syncLastN({
+    required String treeUri,
+    required String destBasePath,
+    required int n,
+  }) async {
+    final res = await _ch.invokeMapMethod<String, dynamic>(
+      'syncResmedLastN',
+      {'treeUri': treeUri, 'destBasePath': destBasePath, 'n': n},
+    );
+    if (res == null) throw Exception('Réponse native nulle (syncResmedLastN).');
+    return res;
+  }
+
+  static Future<Map<String, dynamic>> syncRange({
+    required String treeUri,
+    required String destBasePath,
+    required String fromNightKey, // YYYYMMDD
+    required String toNightKey,   // YYYYMMDD
+  }) async {
+    final res = await _ch.invokeMapMethod<String, dynamic>(
+      'syncResmedRange',
+      {
+        'treeUri': treeUri,
+        'destBasePath': destBasePath,
+        'fromNightKey': fromNightKey,
+        'toNightKey': toNightKey,
+      },
+    );
+    if (res == null) throw Exception('Réponse native nulle (syncResmedRange).');
     return res;
   }
 }

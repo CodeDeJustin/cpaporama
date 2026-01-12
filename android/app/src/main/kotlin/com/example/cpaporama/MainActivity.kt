@@ -10,8 +10,11 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
+import java.util.ArrayDeque
 import java.util.Calendar
 import java.util.Locale
+import kotlin.math.max
+import kotlin.math.min
 
 class MainActivity : FlutterActivity() {
 
@@ -42,6 +45,34 @@ class MainActivity : FlutterActivity() {
                             return@setMethodCallHandler
                         }
                         syncResmedLatest(treeUriStr, destBasePath, result)
+                    }
+
+                    "syncResmedLastN" -> {
+                        val treeUriStr = call.argument<String>("treeUri")
+                        val destBasePath = call.argument<String>("destBasePath")
+                        val n = call.argument<Int>("n") ?: 7
+                        if (treeUriStr.isNullOrBlank() || destBasePath.isNullOrBlank()) {
+                            result.error("bad_args", "treeUri/destBasePath manquant.", null)
+                            return@setMethodCallHandler
+                        }
+                        syncResmedLastN(treeUriStr, destBasePath, n, result)
+                    }
+
+                    "syncResmedRange" -> {
+                        val treeUriStr = call.argument<String>("treeUri")
+                        val destBasePath = call.argument<String>("destBasePath")
+                        val fromNightKey = call.argument<String>("fromNightKey")
+                        val toNightKey = call.argument<String>("toNightKey")
+
+                        if (treeUriStr.isNullOrBlank() ||
+                            destBasePath.isNullOrBlank() ||
+                            fromNightKey.isNullOrBlank() ||
+                            toNightKey.isNullOrBlank()
+                        ) {
+                            result.error("bad_args", "treeUri/destBasePath/fromNightKey/toNightKey manquant.", null)
+                            return@setMethodCallHandler
+                        }
+                        syncResmedRange(treeUriStr, destBasePath, fromNightKey, toNightKey, result)
                     }
 
                     else -> result.notImplemented()
@@ -87,7 +118,7 @@ class MainActivity : FlutterActivity() {
             contentResolver.takePersistableUriPermission(uri, flags)
         } catch (t: Throwable) {
             Log.w("CPAPorama", "takePersistableUriPermission failed: ${t.message}", t)
-            // Certaines ROM sont capricieuses. On continue.
+            // ROM capricieuse? On continue quand même.
         }
 
         res.success(uri.toString())
@@ -128,15 +159,12 @@ class MainActivity : FlutterActivity() {
         Thread {
             try {
                 val treeUri = Uri.parse(treeUriStr)
-
                 val root = DocumentFile.fromTreeUri(this, treeUri)
                     ?: throw IllegalStateException("Tree URI invalide / inaccessible.")
 
                 // SD absente / pas montée: listFiles souvent vide.
                 val rootFiles = safeListFiles(root)
-                if (rootFiles.isEmpty()) {
-                    throw IllegalStateException("Carte SD non détectée. Reconnecte-la.")
-                }
+                if (rootFiles.isEmpty()) throw IllegalStateException("Carte SD non détectée. Reconnecte-la.")
 
                 val datalog = findDatalogDir(root)
                     ?: throw IllegalStateException("DATALOG introuvable (sélectionne la racine SD ou DATALOG).")
@@ -144,64 +172,211 @@ class MainActivity : FlutterActivity() {
                 val entries = collectEdfs(datalog)
                 if (entries.isEmpty()) throw IllegalStateException("Aucun EDF trouvé dans DATALOG.")
 
-                // 1) Repère la session la plus récente
                 val newest = entries.maxByOrNull { it.startKey }!!
-
-                // 2) On synchronise la "nuit" associée (frontière midi)
                 val nightKey = newest.nightKey
-                val nightEntries = entries.filter { it.nightKey == nightKey }
-                if (nightEntries.isEmpty()) throw IllegalStateException("Aucun EDF pour la nuit $nightKey.")
 
-                // 3) Choisir le meilleur EDF à ouvrir: type prioritaire, puis le plus gros fichier
-                val priority = listOf("PLD", "BRP", "SA2", "SAD", "CSL", "EVE", "STR")
-                val bestType = priority.firstOrNull { t -> nightEntries.any { it.type == t } }
-                val candidates = if (bestType != null) nightEntries.filter { it.type == bestType } else nightEntries
-                val chosen = candidates.maxByOrNull { it.doc.length() } ?: newest
-
-                var copied = 0
-                var bestLocalPath: String? = null
-                val touchedSessions = HashSet<String>()
-
-                // 4) Copie tous les EDF de la nuit dans /imports/resmed/<sessionKey>/
-                for (e in nightEntries) {
-                    val sessionDir = File(destBasePath, "resmed/${e.sessionKey}")
-                    if (!sessionDir.exists()) sessionDir.mkdirs()
-
-                    val destFile = File(sessionDir, e.name)
-                    copyDocToFile(e.doc.uri, destFile)
-
-                    copied++
-                    touchedSessions.add(e.sessionKey)
-
-                    if (e.sessionKey == chosen.sessionKey && e.name == chosen.name) {
-                        bestLocalPath = destFile.absolutePath
-                    }
-                }
-
-                val payload = hashMapOf<String, Any?>(
-                    "bestEdfPath" to (bestLocalPath ?: ""),
-                    "sessionKey" to "night_$nightKey",
-                    "copiedCount" to copied,
-                    "nightKey" to nightKey,
-                    "sessionsCount" to touchedSessions.size,
-                    "newestSessionKey" to newest.sessionKey
+                val payload = syncResmedNightKeys(
+                    allEntries = entries,
+                    nightKeys = listOf(nightKey),
+                    destBasePath = destBasePath
                 )
 
-                runOnUiThread { result.success(payload) }
+                // Payload compatible avec l’existant + extras
+                val out = hashMapOf<String, Any?>(
+                    "bestEdfPath" to payload.bestEdfPath,
+                    "sessionKey" to "night_${payload.newestNightKey}",
+                    "copiedCount" to payload.copiedCount,
+                    "skippedCount" to payload.skippedCount,
+                    "nightKey" to payload.newestNightKey,
+                    "nightKeys" to payload.nightKeys,
+                    "sessionsCount" to payload.sessionsCount,
+                    "newestSessionKey" to payload.newestSessionKey
+                )
+
+                runOnUiThread { result.success(out) }
             } catch (t: Throwable) {
                 Log.e("CPAPorama", "syncResmedLatest error", t)
-
                 val (code, msg) = mapError(t)
                 runOnUiThread { result.error(code, msg, null) }
             }
         }.start()
     }
 
+    private fun syncResmedLastN(treeUriStr: String, destBasePath: String, n: Int, result: MethodChannel.Result) {
+        Thread {
+            try {
+                val treeUri = Uri.parse(treeUriStr)
+                val root = DocumentFile.fromTreeUri(this, treeUri)
+                    ?: throw IllegalStateException("Tree URI invalide / inaccessible.")
+
+                val rootFiles = safeListFiles(root)
+                if (rootFiles.isEmpty()) throw IllegalStateException("Carte SD non détectée. Reconnecte-la.")
+
+                val datalog = findDatalogDir(root)
+                    ?: throw IllegalStateException("DATALOG introuvable (sélectionne la racine SD ou DATALOG).")
+
+                val entries = collectEdfs(datalog)
+                if (entries.isEmpty()) throw IllegalStateException("Aucun EDF trouvé dans DATALOG.")
+
+                val allNightKeys = entries.map { it.nightKey }.distinct().sortedDescending()
+                val take = max(1, n)
+                val targetNightKeys = allNightKeys.take(take)
+                if (targetNightKeys.isEmpty()) throw IllegalStateException("Aucune nuit disponible à synchroniser.")
+
+                val payload = syncResmedNightKeys(
+                    allEntries = entries,
+                    nightKeys = targetNightKeys,
+                    destBasePath = destBasePath
+                )
+
+                val out = hashMapOf<String, Any?>(
+                    "bestEdfPath" to payload.bestEdfPath,
+                    "copiedCount" to payload.copiedCount,
+                    "skippedCount" to payload.skippedCount,
+                    "nightKeys" to payload.nightKeys,
+                    "newestNightKey" to payload.newestNightKey,
+                    "sessionsCount" to payload.sessionsCount,
+                    "newestSessionKey" to payload.newestSessionKey
+                )
+
+                runOnUiThread { result.success(out) }
+            } catch (t: Throwable) {
+                Log.e("CPAPorama", "syncResmedLastN error", t)
+                val (code, msg) = mapError(t)
+                runOnUiThread { result.error(code, msg, null) }
+            }
+        }.start()
+    }
+
+    private fun syncResmedRange(
+        treeUriStr: String,
+        destBasePath: String,
+        fromNightKey: String,
+        toNightKey: String,
+        result: MethodChannel.Result
+    ) {
+        Thread {
+            try {
+                val treeUri = Uri.parse(treeUriStr)
+                val root = DocumentFile.fromTreeUri(this, treeUri)
+                    ?: throw IllegalStateException("Tree URI invalide / inaccessible.")
+
+                val rootFiles = safeListFiles(root)
+                if (rootFiles.isEmpty()) throw IllegalStateException("Carte SD non détectée. Reconnecte-la.")
+
+                val datalog = findDatalogDir(root)
+                    ?: throw IllegalStateException("DATALOG introuvable (sélectionne la racine SD ou DATALOG).")
+
+                val entries = collectEdfs(datalog)
+                if (entries.isEmpty()) throw IllegalStateException("Aucun EDF trouvé dans DATALOG.")
+
+                val lo = minOf(fromNightKey, toNightKey)
+                val hi = maxOf(fromNightKey, toNightKey)
+
+                val targetNightKeys = entries
+                    .map { it.nightKey }
+                    .filter { it >= lo && it <= hi }
+                    .distinct()
+                    .sortedDescending()
+
+                if (targetNightKeys.isEmpty()) throw IllegalStateException("Aucune nuit dans la plage $lo → $hi.")
+
+                val payload = syncResmedNightKeys(
+                    allEntries = entries,
+                    nightKeys = targetNightKeys,
+                    destBasePath = destBasePath
+                )
+
+                val out = hashMapOf<String, Any?>(
+                    "bestEdfPath" to payload.bestEdfPath,
+                    "copiedCount" to payload.copiedCount,
+                    "skippedCount" to payload.skippedCount,
+                    "nightKeys" to payload.nightKeys,
+                    "newestNightKey" to payload.newestNightKey,
+                    "sessionsCount" to payload.sessionsCount,
+                    "newestSessionKey" to payload.newestSessionKey
+                )
+
+                runOnUiThread { result.success(out) }
+            } catch (t: Throwable) {
+                Log.e("CPAPorama", "syncResmedRange error", t)
+                val (code, msg) = mapError(t)
+                runOnUiThread { result.error(code, msg, null) }
+            }
+        }.start()
+    }
+
+    private data class SyncPayload(
+        val bestEdfPath: String,
+        val copiedCount: Int,
+        val skippedCount: Int,
+        val nightKeys: List<String>,
+        val newestNightKey: String,
+        val sessionsCount: Int,
+        val newestSessionKey: String
+    )
+
+    private fun syncResmedNightKeys(
+        allEntries: List<Entry>,
+        nightKeys: List<String>,
+        destBasePath: String
+    ): SyncPayload {
+        val setKeys = nightKeys.toHashSet()
+        val targetEntries = allEntries.filter { setKeys.contains(it.nightKey) }
+        if (targetEntries.isEmpty()) throw IllegalStateException("Aucun EDF pour les nuits demandées.")
+
+        val newest = targetEntries.maxByOrNull { it.startKey }!!
+        val newestNightKey = newest.nightKey
+
+        // "Meilleur EDF" = type prioritaire, sinon plus gros fichier, sur la nuit la plus récente.
+        val newestNightEntries = targetEntries.filter { it.nightKey == newestNightKey }
+        val priority = listOf("PLD", "BRP", "SA2", "SAD", "CSL", "EVE", "STR")
+        val bestType = priority.firstOrNull { t -> newestNightEntries.any { it.type == t } }
+        val candidates = if (bestType != null) newestNightEntries.filter { it.type == bestType } else newestNightEntries
+        val chosen = candidates.maxByOrNull { it.doc.length() } ?: newest
+
+        var copied = 0
+        var skipped = 0
+        var bestLocalPath: String? = null
+        val touchedSessions = HashSet<String>()
+
+        for (e in targetEntries) {
+            val sessionDir = File(destBasePath, "resmed/${e.sessionKey}")
+            if (!sessionDir.exists()) sessionDir.mkdirs()
+
+            val destFile = File(sessionDir, e.name)
+
+            val srcLen = e.doc.length()
+            val canSkip = srcLen > 0 && destFile.exists() && destFile.length().toLong() == srcLen
+
+            if (canSkip) {
+                skipped++
+            } else {
+                copyDocToFile(e.doc.uri, destFile)
+                copied++
+            }
+
+            touchedSessions.add(e.sessionKey)
+
+            if (e.sessionKey == chosen.sessionKey && e.name == chosen.name) {
+                bestLocalPath = destFile.absolutePath
+            }
+        }
+
+        return SyncPayload(
+            bestEdfPath = bestLocalPath ?: "",
+            copiedCount = copied,
+            skippedCount = skipped,
+            nightKeys = nightKeys,
+            newestNightKey = newestNightKey,
+            sessionsCount = touchedSessions.size,
+            newestSessionKey = newest.sessionKey
+        )
+    }
+
     private fun mapError(t: Throwable): Pair<String, String> {
-        // Codes stables côté Flutter
         val msg = t.message ?: "Erreur inconnue"
 
-        // SecurityException / permissions
         if (t is SecurityException) {
             return "permission_lost" to "Permission perdue. Reconnecte la carte SD (ou reconnecte via Connecter)."
         }
@@ -211,7 +386,7 @@ class MainActivity : FlutterActivity() {
             low.contains("carte sd non détectée") || low.contains("non détectée") ->
                 "sd_missing" to "Carte SD non détectée. Reconnecte-la."
 
-            low.contains("datalog introuvable") || low.contains("datalog") && low.contains("introuvable") ->
+            (low.contains("datalog") && low.contains("introuvable")) ->
                 "datalog_missing" to "Dossier ResMed introuvable. Sélectionne la racine SD ou le dossier DATALOG."
 
             low.contains("tree uri invalide") || low.contains("inaccessible") || low.contains("permission") ->
@@ -231,7 +406,7 @@ class MainActivity : FlutterActivity() {
 
     private fun collectEdfs(datalog: DocumentFile): List<Entry> {
         val out = ArrayList<Entry>()
-        val stack = ArrayDeque<DocumentFile>()
+        val stack: ArrayDeque<DocumentFile> = ArrayDeque()
         stack.add(datalog)
 
         val rx = Regex("""^(\d{8})_(\d{6})_([A-Za-z0-9]{3})\.edf$""")
@@ -253,16 +428,26 @@ class MainActivity : FlutterActivity() {
                 val startKey = (ymd + hms).toLongOrNull() ?: 0L
                 val nightKey = nightKeyFrom(ymd, hms)
 
-                out.add(Entry(child, sessionKey, startKey, type, name, nightKey))
+                out.add(
+                    Entry(
+                        doc = child,
+                        sessionKey = sessionKey,
+                        startKey = startKey,
+                        type = type,
+                        name = name,
+                        nightKey = nightKey
+                    )
+                )
             }
         }
+
         return out
     }
 
     private fun safeListFiles(dir: DocumentFile): Array<DocumentFile> {
         return try {
             dir.listFiles()
-        } catch (t: Throwable) {
+        } catch (_: Throwable) {
             emptyArray()
         }
     }

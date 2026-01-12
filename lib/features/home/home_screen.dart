@@ -4,11 +4,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
-import '../../core/imports/resmed_night_catalog.dart';
 import '../../core/imports/resmed_saf_bridge.dart';
 import '../../core/imports/resmed_source_prefs.dart';
+import '../../core/nights/night_repository.dart';
+import '../../core/storage/app_db_provider.dart';
 import '../imports/import_screen.dart';
 import '../nights/night_viewer_screen.dart';
+import '../stats/stats_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -18,8 +20,15 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
-  // Nights
-  List<ResmedNightSummary> _nights = [];
+  // Repo (DB index)
+  final NightRepository _repo = NightRepository(appDb);
+
+  // UI filter
+  DateTimeRange? _range; // mode "plage"
+  int? _latestN; // mode "dernières N" (null = pas de limite)
+
+  // Nights (from DB index)
+  List<NightListItem> _nights = [];
   bool _loadingNights = false;
 
   // Auto-sync (SAF)
@@ -39,6 +48,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   String _fmtDate(DateTime dt) =>
       '${dt.year.toString().padLeft(4, '0')}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+
+  String _filterText() {
+    if (_range != null) {
+      return 'Plage: ${_fmtDate(_range!.start)} → ${_fmtDate(_range!.end)}';
+    }
+    if (_latestN != null) {
+      return 'Dernières: $_latestN nuits';
+    }
+    return 'Plage: toutes';
+  }
+
+  bool get _hasActiveFilter => _range != null || _latestN != null;
 
   Future<Directory> _getImportsDir() async {
     final appDocs = await getApplicationDocumentsDirectory();
@@ -101,16 +122,32 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _lastAutoSync = null;
       _lastAutoSyncAttempt = null;
     });
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Carte SD oubliée. Tu peux reconnecter.')),
     );
   }
 
   Future<void> _loadNights({bool setLoadingState = true}) async {
-    if (setLoadingState) setState(() => _loadingNights = true);
+    if (setLoadingState) {
+      setState(() {
+        _loadingNights = true;
+        _nights = []; // évite l’ancienne liste qui "reste longue"
+      });
+    }
+
     try {
-      final dir = await _getImportsDir();
-      final nights = await ResmedNightCatalog.scan(dir);
+      await _repo.ensureIndexBuilt();
+
+      final r = _range;
+      final limit = (r == null) ? _latestN : null;
+
+      final nights = await _repo.listNights(
+        from: r?.start,
+        to: r?.end,
+        limit: limit,
+      );
+
       if (!mounted) return;
       setState(() {
         _nights = nights;
@@ -122,35 +159,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  ResmedNightSummary? _findNightByKey(String nightKey) {
-    // nightKey attendu: "YYYYMMDD"
-    for (final n in _nights) {
-      if (_fmtDate(n.nightDate).replaceAll('-', '') == nightKey) return n;
-    }
-    return null;
-  }
+  Future<void> _openNightViewerByKey(String nightKey) async {
+    final night = await _repo.getNight(nightKey);
+    if (!mounted) return;
 
-  void _openNightViewer(ResmedNightSummary night) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => NightViewerScreen(night: night)),
-      );
-    });
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => NightViewerScreen(night: night)),
+    );
   }
 
   Future<void> _pairSd() async {
     try {
       final uri = await ResmedSafBridge.pickTree();
       if (uri == null || uri.isEmpty) return;
+
       await ResmedSourcePrefs.setTreeUri(uri);
+
       if (!mounted) return;
       setState(() {
         _autoStatus = 'Carte SD: autorisée';
         _autoHadError = false;
         _autoUserError = null;
       });
+
       await _refreshPairing();
       await _tryAutoSync(force: true);
     } catch (e) {
@@ -173,7 +205,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!isCurrent) return;
     }
 
-    // Anti spam (auto)
+    // Anti-spam (auto)
     final now = DateTime.now();
     if (!force &&
         _lastAutoSyncAttempt != null &&
@@ -214,15 +246,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final sessionKey = (res['sessionKey'] as String?) ?? '';
       final nightKey = (res['nightKey'] as String?) ?? '';
       final copiedCount = (res['copiedCount'] as int?) ?? 0;
+      final skippedCount = (res['skippedCount'] as int?) ?? 0;
 
-      if (copiedCount <= 0) throw Exception('Aucun fichier copié');
-
+      // Rebuild index (v0.2.8: simple et fiable)
+      await _repo.rebuildIndexFromImports();
       await _loadNights(setLoadingState: false);
 
       if (!mounted) return;
       setState(() {
         _lastAutoSync = DateTime.now();
-        _autoStatus = 'Synchronisation: OK • $copiedCount fichier(s)';
+        _autoStatus = (copiedCount > 0)
+            ? 'Synchronisation: OK • $copiedCount copié(s), $skippedCount déjà présents'
+            : 'Synchronisation: OK • déjà à jour';
         _isAutoSyncing = false;
         _autoHadError = false;
         _autoUserError = null;
@@ -233,16 +268,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (sessionKey == _lastAutoOpenedSessionKey) return;
       _lastAutoOpenedSessionKey = sessionKey;
 
-      ResmedNightSummary? night;
+      // Choix de la nuit à ouvrir
+      String? targetNightKey;
       if (nightKey.length == 8) {
-        night = _findNightByKey(nightKey);
+        targetNightKey = nightKey;
+      } else if (_nights.isNotEmpty) {
+        targetNightKey = _nights.first.nightKey;
       }
-      night ??= _nights.isNotEmpty ? _nights.first : null;
 
-      if (night == null) return;
+      if (targetNightKey == null || targetNightKey.isEmpty) return;
 
       final canNavigate = ModalRoute.of(context)?.isCurrent ?? true;
-      if (canNavigate) _openNightViewer(night);
+      if (canNavigate) {
+        // ignore: unawaited_futures
+        _openNightViewerByKey(targetNightKey);
+      }
     } catch (e) {
       if (!mounted) return;
       final msg = _humanizeAutoError(e);
@@ -253,6 +293,163 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _autoUserError = msg;
       });
     }
+  }
+
+  Future<void> _syncLastN(int n) async {
+    final treeUri = await ResmedSourcePrefs.getTreeUri();
+    if (treeUri == null || treeUri.isEmpty) return;
+
+    if (!mounted) return;
+    setState(() {
+      // IMPORTANT: applique le filtre "Dernières N" tout de suite
+      _latestN = n;
+      _range = null;
+
+      // UI propre (la liste ne "reste pas longue")
+      _nights = [];
+      _loadingNights = true;
+
+      _isAutoSyncing = true;
+      _autoStatus = 'Synchronisation historique: en cours…';
+      _autoHadError = false;
+      _autoUserError = null;
+    });
+
+    try {
+      final importsDir = await _getImportsDir();
+      if (!await importsDir.exists()) await importsDir.create(recursive: true);
+
+      final res = await ResmedSafBridge.syncLastN(
+        treeUri: treeUri,
+        destBasePath: importsDir.path,
+        n: n,
+      );
+
+      final copiedCount = (res['copiedCount'] as int?) ?? 0;
+      final skippedCount = (res['skippedCount'] as int?) ?? 0;
+
+      await _repo.rebuildIndexFromImports();
+      await _loadNights(setLoadingState: false);
+
+      if (!mounted) return;
+      setState(() {
+        _lastAutoSync = DateTime.now();
+        _autoStatus = 'Historique: OK • $copiedCount copié(s), $skippedCount déjà présents';
+        _isAutoSyncing = false;
+        _autoHadError = false;
+        _autoUserError = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      final msg = _humanizeAutoError(e);
+      setState(() {
+        _autoStatus = 'Historique: échec';
+        _isAutoSyncing = false;
+        _autoHadError = true;
+        _autoUserError = msg;
+        _loadingNights = false;
+      });
+    }
+  }
+
+  void _openHistorySheet() {
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(
+              title: Text('Sync historique'),
+              subtitle: Text('Importe plusieurs nuits depuis la SD (offline, local).'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.history),
+              title: const Text('3 dernières nuits'),
+              onTap: () {
+                Navigator.pop(context);
+                _syncLastN(3);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.history),
+              title: const Text('7 dernières nuits'),
+              onTap: () {
+                Navigator.pop(context);
+                _syncLastN(7);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.history),
+              title: const Text('14 dernières nuits'),
+              onTap: () {
+                Navigator.pop(context);
+                _syncLastN(14);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.history),
+              title: const Text('30 dernières nuits'),
+              onTap: () {
+                Navigator.pop(context);
+                _syncLastN(30);
+              },
+            ),
+            const SizedBox(height: 10),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Deux date pickers (début / fin) comme tu voulais.
+  Future<void> _pickStartEndDates() async {
+    final now = DateTime.now();
+
+    final startInit = _range?.start ?? now.subtract(const Duration(days: 30));
+    final endInit = _range?.end ?? now;
+
+    final start = await showDatePicker(
+      context: context,
+      initialDate: DateTime(startInit.year, startInit.month, startInit.day),
+      firstDate: DateTime(now.year - 5, 1, 1),
+      lastDate: DateTime(now.year + 1, 12, 31),
+    );
+    if (!mounted || start == null) return;
+
+    final end = await showDatePicker(
+      context: context,
+      initialDate: DateTime(endInit.year, endInit.month, endInit.day).isBefore(start) ? start : endInit,
+      firstDate: start,
+      lastDate: DateTime(now.year + 1, 12, 31),
+    );
+    if (!mounted || end == null) return;
+
+    setState(() {
+      _range = DateTimeRange(start: start, end: end);
+      _latestN = null; // mode plage prend le dessus
+    });
+
+    await _loadNights(setLoadingState: true);
+  }
+
+  void _clearFilter() {
+    setState(() {
+      _range = null;
+      _latestN = null;
+    });
+    _loadNights(setLoadingState: true);
+  }
+
+  void _openStats() {
+    // NOTE: StatsScreen montre la plage si définie. Si tu veux que "Dernières N"
+    // s'applique aussi aux stats, on patchera StatsScreen ensuite.
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => StatsScreen(repo: _repo, range: _range, limit: _range == null ? _latestN : null),
+      ),
+    );
   }
 
   void _openAdvanced() {
@@ -297,15 +494,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    final filterText = _filterText();
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('CPAPorama'),
         actions: [
           IconButton(
+            onPressed: _pickStartEndDates,
+            icon: const Icon(Icons.date_range),
+            tooltip: 'Début / Fin',
+          ),
+          IconButton(
+            onPressed: _openStats,
+            icon: const Icon(Icons.query_stats),
+            tooltip: 'Stats',
+          ),
+          IconButton(
             onPressed: _openAdvanced,
             icon: const Icon(Icons.tune),
             tooltip: 'Avancé',
-          )
+          ),
         ],
       ),
       body: ListView(
@@ -350,6 +559,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       icon: const Icon(Icons.sync),
                       label: const Text('Synchroniser'),
                     ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: _isAutoSyncing ? null : _openHistorySheet,
+                      icon: const Icon(Icons.history),
+                      label: const Text('Historique'),
+                    ),
                   ],
 
                   if (_isAutoSyncing) ...[
@@ -375,11 +590,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('Nuits', style: Theme.of(context).textTheme.titleMedium),
-              IconButton(
-                onPressed: _loadingNights ? null : () => _loadNights(),
-                icon: const Icon(Icons.refresh),
-                tooltip: 'Rafraîchir',
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Nuits', style: Theme.of(context).textTheme.titleMedium),
+                  Text(filterText, style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ),
+              Row(
+                children: [
+                  if (_hasActiveFilter)
+                    IconButton(
+                      onPressed: _clearFilter,
+                      icon: const Icon(Icons.clear),
+                      tooltip: 'Effacer le filtre',
+                    ),
+                  IconButton(
+                    onPressed: _loadingNights ? null : () => _loadNights(),
+                    icon: const Icon(Icons.refresh),
+                    tooltip: 'Rafraîchir',
+                  ),
+                ],
               ),
             ],
           ),
@@ -391,7 +622,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
           if (_nights.isEmpty && !_loadingNights) ...[
             const SizedBox(height: 8),
-            const Text('Aucune nuit ResMed détectée. Connecte la carte SD pour synchroniser.'),
+            const Text('Aucune nuit détectée (dans l’index). Connecte la carte SD pour synchroniser.'),
           ],
 
           if (_nights.isNotEmpty) ...[
@@ -405,9 +636,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 child: ListTile(
                   leading: const Icon(Icons.nightlight_round),
                   title: Text(date),
-                  subtitle: Text('Segments: ${n.segmentsCount} • $start → $end'),
+                  subtitle: Text('Segments: ${n.sessionsCount} • gaps: ${n.gapCount} • $start → $end'),
                   trailing: const Icon(Icons.chevron_right),
-                  onTap: () => _openNightViewer(n),
+                  onTap: () => _openNightViewerByKey(n.nightKey),
                 ),
               );
             }),
