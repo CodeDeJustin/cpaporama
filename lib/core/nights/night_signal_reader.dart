@@ -40,10 +40,28 @@ class NightSignalReader {
     return null;
   }
 
+  /// Back-compat (int) -> route vers la version float.
   static Future<NightWindowReadResult> readWindow({
     required NightTimeline timeline,
     required int globalStartSeconds,
     required int windowSeconds,
+    required String signalLabel,
+    int maxPoints = 3000,
+  }) {
+    return readWindowF(
+      timeline: timeline,
+      globalStartSeconds: globalStartSeconds.toDouble(),
+      windowSeconds: windowSeconds.toDouble(),
+      signalLabel: signalLabel,
+      maxPoints: maxPoints,
+    );
+  }
+
+  /// Version float: start/span continus (pan/zoom sans “clic”)
+  static Future<NightWindowReadResult> readWindowF({
+    required NightTimeline timeline,
+    required double globalStartSeconds,
+    required double windowSeconds,
     required String signalLabel,
     int maxPoints = 3000,
   }) async {
@@ -51,34 +69,33 @@ class NightSignalReader {
     final out = <EdfDataPoint>[];
 
     String unit = '';
-    int? lastCovered; // en secondes globales
+    double? lastCovered; // secondes globales
 
-    void addGap(int a, int b) {
+    void addGap(double a, double b) {
       if (b <= a) return;
-      // Deux NaN suffisent: le chart coupe la ligne (et on évite toute diagonale)
-      out.add(EdfDataPoint(a.toDouble(), double.nan));
-      out.add(EdfDataPoint(b.toDouble(), double.nan));
+      out.add(EdfDataPoint(a, double.nan));
+      out.add(EdfDataPoint(b, double.nan));
     }
 
     // segments qui intersectent [globalStart, globalEnd]
     final segs = timeline.segments.where((s) {
-      final s0 = s.offsetSeconds;
-      final s1 = s.endOffsetSeconds;
+      final s0 = s.offsetSeconds.toDouble();
+      final s1 = s.endOffsetSeconds.toDouble();
       return s1 > globalStartSeconds && s0 < globalEnd;
     }).toList()
       ..sort((a, b) => a.offsetSeconds.compareTo(b.offsetSeconds));
 
     for (final seg in segs) {
-      final segStart = seg.offsetSeconds;
-      final segEnd = seg.endOffsetSeconds;
+      final segStart = seg.offsetSeconds.toDouble();
+      final segEnd = seg.endOffsetSeconds.toDouble();
 
-      final localStart = max(0, globalStartSeconds - segStart);
-      final localEnd = min(seg.durationSeconds, globalEnd - segStart);
-      final localWindow = max(0, localEnd - localStart);
+      final localStart = max(0.0, globalStartSeconds - segStart);
+      final localEnd = min(seg.durationSeconds.toDouble(), globalEnd - segStart);
+      final localWindow = max(0.0, localEnd - localStart);
 
       if (localWindow <= 0) continue;
 
-      // Gap entre couverture précédente et ce segment (dans la fenêtre)
+      // gap avant ce segment
       if (lastCovered == null) {
         if (segStart > globalStartSeconds) {
           addGap(globalStartSeconds, min(segStart, globalEnd));
@@ -95,11 +112,11 @@ class NightSignalReader {
       final idx = _findIndexByLabel(header, signalLabel);
 
       if (idx == null) {
-        // signal absent => gap sur la portion de fenêtre couverte par ce segment
+        // signal absent => gap sur portion couverte par ce segment
         final a = segStart + localStart;
         final b = segStart + localEnd;
         addGap(max(a, globalStartSeconds), min(b, globalEnd));
-        lastCovered = max(lastCovered ?? 0, min(segStart + localEnd, globalEnd));
+        lastCovered = max(lastCovered ?? 0.0, min(segStart + localEnd, globalEnd));
         continue;
       }
 
@@ -107,34 +124,32 @@ class NightSignalReader {
         unit = header.signals[idx].physicalDimension.trim();
       }
 
-      // Budget points: éviter d’exploser si plusieurs segments
       final remaining = max(100, maxPoints - out.length);
       if (remaining <= 0) break;
 
-      final series = await EdfSignalReader.readSignalSeries(
+      final series = await EdfSignalReader.readSignalSeriesF(
         file: file,
         header: header,
         signalIndex: idx,
-        startSeconds: localStart,
+        startTimeSeconds: localStart,
         windowSeconds: localWindow,
         maxPoints: remaining,
       );
 
-      final baseGlobal = (segStart + localStart).toDouble();
+      final baseGlobal = segStart + localStart;
       for (final p in series.points) {
         out.add(EdfDataPoint(baseGlobal + p.tSeconds, p.value));
       }
 
-      lastCovered = max(lastCovered ?? 0, min(segStart + localEnd, globalEnd));
+      lastCovered = max(lastCovered ?? 0.0, min(segStart + localEnd, globalEnd));
       if ((maxPoints - out.length) <= 0) break;
     }
 
-    // Gap final si on finit avant globalEnd
+    // gap final
     if (lastCovered != null && lastCovered! < globalEnd) {
       addGap(max(lastCovered!, globalStartSeconds), globalEnd);
     }
 
-    // Nettoyage si on a trop de points
     if (out.length > maxPoints) {
       out.removeRange(maxPoints, out.length);
     }
