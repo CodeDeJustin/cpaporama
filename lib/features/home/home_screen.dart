@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart'; // kDebugMode
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -23,7 +24,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // Repo (DB index)
   final NightRepository _repo = NightRepository(appDb);
 
-  // UI filter
+  // UI filter (source de vérité)
   DateTimeRange? _range; // mode "plage"
   int? _latestN; // mode "dernières N" (null = pas de limite)
 
@@ -42,6 +43,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _autoHadError = false;
 
   String? _lastAutoOpenedSessionKey;
+
+  // Diagnostics (optionnel mais utile)
+  int? _lastCopiedCount;
+  int? _lastSkippedCount;
+  String? _lastSyncKind; // 'latest' | 'lastN' | 'range' (si tu ajoutes range)
 
   String _fmtClock(DateTime dt) =>
       '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
@@ -71,11 +77,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       _pairedTreeUri = (uri != null && uri.isNotEmpty) ? uri : null;
-      if (_pairedTreeUri == null) {
-        _autoStatus = 'Carte SD: non connectée';
-      } else {
-        _autoStatus = 'Carte SD: autorisée';
-      }
+      _autoStatus = (_pairedTreeUri == null) ? 'Carte SD: non connectée' : 'Carte SD: autorisée';
     });
   }
 
@@ -121,6 +123,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _lastAutoOpenedSessionKey = null;
       _lastAutoSync = null;
       _lastAutoSyncAttempt = null;
+      _lastCopiedCount = null;
+      _lastSkippedCount = null;
+      _lastSyncKind = null;
     });
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -232,6 +237,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _autoStatus = 'Synchronisation: en cours…';
       _autoHadError = false;
       _autoUserError = null;
+      _lastSyncKind = 'latest';
     });
 
     try {
@@ -243,13 +249,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         destBasePath: importsDir.path,
       );
 
+      final nightKeys = ((res['nightKeys'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .where((k) => k.length == 8)
+          .toList();
+
+      // ✅ v0.2.9: upsert ciblé (fallback rebuild si rien n’est retourné)
+      if (nightKeys.isNotEmpty) {
+        await _repo.upsertIndexForNightKeys(nightKeys);
+      } else {
+        await _repo.rebuildIndexFromImports();
+      }
+
       final sessionKey = (res['sessionKey'] as String?) ?? '';
       final nightKey = (res['nightKey'] as String?) ?? '';
       final copiedCount = (res['copiedCount'] as int?) ?? 0;
       final skippedCount = (res['skippedCount'] as int?) ?? 0;
 
-      // Rebuild index (v0.2.8: simple et fiable)
-      await _repo.rebuildIndexFromImports();
+      _lastCopiedCount = copiedCount;
+      _lastSkippedCount = skippedCount;
+
       await _loadNights(setLoadingState: false);
 
       if (!mounted) return;
@@ -301,11 +320,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
     setState(() {
-      // IMPORTANT: applique le filtre "Dernières N" tout de suite
+      // Filtre = source de vérité: applique "Dernières N" tout de suite
       _latestN = n;
       _range = null;
 
-      // UI propre (la liste ne "reste pas longue")
+      // UI propre
       _nights = [];
       _loadingNights = true;
 
@@ -313,6 +332,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _autoStatus = 'Synchronisation historique: en cours…';
       _autoHadError = false;
       _autoUserError = null;
+      _lastSyncKind = 'lastN';
     });
 
     try {
@@ -325,10 +345,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         n: n,
       );
 
+      final nightKeys = ((res['nightKeys'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .where((k) => k.length == 8)
+          .toList();
+
+      // ✅ v0.2.9: upsert ciblé (fallback rebuild)
+      if (nightKeys.isNotEmpty) {
+        await _repo.upsertIndexForNightKeys(nightKeys);
+      } else {
+        await _repo.rebuildIndexFromImports();
+      }
+
       final copiedCount = (res['copiedCount'] as int?) ?? 0;
       final skippedCount = (res['skippedCount'] as int?) ?? 0;
 
-      await _repo.rebuildIndexFromImports();
+      _lastCopiedCount = copiedCount;
+      _lastSkippedCount = skippedCount;
+
       await _loadNights(setLoadingState: false);
 
       if (!mounted) return;
@@ -402,7 +436,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  // Deux date pickers (début / fin) comme tu voulais.
+  // Deux date pickers (début / fin)
   Future<void> _pickStartEndDates() async {
     final now = DateTime.now();
 
@@ -442,12 +476,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _openStats() {
-    // NOTE: StatsScreen montre la plage si définie. Si tu veux que "Dernières N"
-    // s'applique aussi aux stats, on patchera StatsScreen ensuite.
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => StatsScreen(repo: _repo, range: _range, limit: _range == null ? _latestN : null),
+        builder: (_) => StatsScreen(
+          repo: _repo,
+          range: _range,
+          limit: _range == null ? _latestN : null,
+        ),
       ),
     );
   }
@@ -461,6 +497,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           enableAutoSync: false,
           showSdCard: false,
           showResmedNights: false,
+        ),
+      ),
+    );
+  }
+
+  void _openDiagnostics() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => _DiagnosticsScreen(
+          repo: _repo,
+          pairedTreeUri: _pairedTreeUri,
+          autoStatus: _autoStatus,
+          lastSync: _lastAutoSync,
+          lastCopiedCount: _lastCopiedCount,
+          lastSkippedCount: _lastSkippedCount,
+          lastSyncKind: _lastSyncKind,
+          filterText: _filterText(),
+          currentListCount: _nights.length,
+          isAutoSyncing: _isAutoSyncing,
+          onRebuildIndex: () async {
+            await _repo.rebuildIndexFromImports();
+            await _loadNights(setLoadingState: true);
+          },
+          onReload: () async {
+            await _loadNights(setLoadingState: true);
+          },
         ),
       ),
     );
@@ -495,6 +558,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final filterText = _filterText();
+    final nightsCountText = '${_nights.length} nuit${_nights.length == 1 ? '' : 's'}';
 
     return Scaffold(
       appBar: AppBar(
@@ -510,11 +574,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             icon: const Icon(Icons.query_stats),
             tooltip: 'Stats',
           ),
-          IconButton(
-            onPressed: _openAdvanced,
-            icon: const Icon(Icons.tune),
-            tooltip: 'Avancé',
-          ),
+          if (kDebugMode)
+            IconButton(
+              onPressed: _openDiagnostics,
+              icon: const Icon(Icons.bug_report),
+              tooltip: 'Diagnostics',
+            ),
+          if (kDebugMode)
+            IconButton(
+              onPressed: _openAdvanced,
+              icon: const Icon(Icons.tune),
+              tooltip: 'Avancé',
+            ),
         ],
       ),
       body: ListView(
@@ -595,6 +666,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 children: [
                   Text('Nuits', style: Theme.of(context).textTheme.titleMedium),
                   Text(filterText, style: Theme.of(context).textTheme.bodySmall),
+                  Text(nightsCountText, style: Theme.of(context).textTheme.bodySmall),
                 ],
               ),
               Row(
@@ -606,7 +678,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       tooltip: 'Effacer le filtre',
                     ),
                   IconButton(
-                    onPressed: _loadingNights ? null : () => _loadNights(),
+                    onPressed: _loadingNights ? null : () => _loadNights(setLoadingState: true),
                     icon: const Icon(Icons.refresh),
                     tooltip: 'Rafraîchir',
                   ),
@@ -622,7 +694,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
           if (_nights.isEmpty && !_loadingNights) ...[
             const SizedBox(height: 8),
-            const Text('Aucune nuit détectée (dans l’index). Connecte la carte SD pour synchroniser.'),
+            Text(
+              _hasActiveFilter
+                  ? 'Aucune nuit pour ce filtre. Efface le filtre ou synchronise.'
+                  : 'Aucune nuit détectée (index). Connecte la carte SD pour synchroniser.',
+            ),
           ],
 
           if (_nights.isNotEmpty) ...[
@@ -643,6 +719,136 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               );
             }),
           ],
+        ],
+      ),
+    );
+  }
+}
+
+// Dev-only, minimaliste, et surtout compilable.
+// Tu pourras le déplacer dans un fichier séparé plus tard.
+class _DiagnosticsScreen extends StatefulWidget {
+  const _DiagnosticsScreen({
+    required this.repo,
+    required this.pairedTreeUri,
+    required this.autoStatus,
+    required this.lastSync,
+    required this.lastCopiedCount,
+    required this.lastSkippedCount,
+    required this.lastSyncKind,
+    required this.filterText,
+    required this.currentListCount,
+    required this.isAutoSyncing,
+    required this.onRebuildIndex,
+    required this.onReload,
+  });
+
+  final NightRepository repo;
+  final String? pairedTreeUri;
+  final String autoStatus;
+  final DateTime? lastSync;
+  final int? lastCopiedCount;
+  final int? lastSkippedCount;
+  final String? lastSyncKind;
+  final String filterText;
+  final int currentListCount;
+  final bool isAutoSyncing;
+
+  final Future<void> Function() onRebuildIndex;
+  final Future<void> Function() onReload;
+
+  @override
+  State<_DiagnosticsScreen> createState() => _DiagnosticsScreenState();
+}
+
+class _DiagnosticsScreenState extends State<_DiagnosticsScreen> {
+  bool _busy = false;
+
+  String _fmtDateTime(DateTime dt) =>
+      '${dt.year.toString().padLeft(4, '0')}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
+          '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+
+  Future<void> _run(Future<void> Function() action) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await action();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('OK')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Erreur: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final lastSyncText = widget.lastSync == null ? '—' : _fmtDateTime(widget.lastSync!);
+    final copied = widget.lastCopiedCount?.toString() ?? '—';
+    final skipped = widget.lastSkippedCount?.toString() ?? '—';
+    final kind = widget.lastSyncKind ?? '—';
+    final paired = (widget.pairedTreeUri == null) ? 'non' : 'oui';
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Diagnostics (dev)')),
+      body: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('État', style: Theme.of(context).textTheme.titleMedium),
+                  const SizedBox(height: 8),
+                  Text('SD pairée: $paired'),
+                  Text('Statut: ${widget.autoStatus}'),
+                  Text('Dernier sync: $lastSyncText'),
+                  Text('Dernier sync kind: $kind'),
+                  Text('Dernier sync copied/skipped: $copied / $skipped'),
+                  Text('Auto-sync en cours: ${widget.isAutoSyncing ? 'oui' : 'non'}'),
+                  const SizedBox(height: 8),
+                  Text('Filtre: ${widget.filterText}'),
+                  Text('Liste actuelle: ${widget.currentListCount} nuit(s)'),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('Actions', style: Theme.of(context).textTheme.titleMedium),
+                  const SizedBox(height: 8),
+                  FilledButton.icon(
+                    onPressed: _busy ? null : () => _run(widget.onReload),
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Recharger la liste'),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: _busy ? null : () => _run(widget.onRebuildIndex),
+                    icon: const Icon(Icons.build),
+                    label: const Text('Reconstruire index (bulldozer)'),
+                  ),
+                  if (_busy) ...[
+                    const SizedBox(height: 12),
+                    const LinearProgressIndicator(),
+                  ],
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
