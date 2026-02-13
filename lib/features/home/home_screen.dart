@@ -12,6 +12,7 @@ import '../../core/storage/app_db_provider.dart';
 import '../imports/import_screen.dart';
 import '../nights/night_viewer_screen.dart';
 import '../stats/stats_screen.dart';
+import 'widgets/date_range_picker_sheet.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -436,31 +437,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  // Deux date pickers (début / fin)
   Future<void> _pickStartEndDates() async {
     final now = DateTime.now();
-
-    final startInit = _range?.start ?? now.subtract(const Duration(days: 30));
-    final endInit = _range?.end ?? now;
-
-    final start = await showDatePicker(
-      context: context,
-      initialDate: DateTime(startInit.year, startInit.month, startInit.day),
-      firstDate: DateTime(now.year - 5, 1, 1),
-      lastDate: DateTime(now.year + 1, 12, 31),
+    final selectedRange = await showDateRangePickerSheet(
+      context,
+      initialStart: _range?.start ?? now.subtract(const Duration(days: 30)),
+      initialEnd: _range?.end ?? now,
+      minDate: DateTime(now.year - 5, 1, 1),
+      maxDate: DateTime(now.year + 1, 12, 31),
     );
-    if (!mounted || start == null) return;
 
-    final end = await showDatePicker(
-      context: context,
-      initialDate: DateTime(endInit.year, endInit.month, endInit.day).isBefore(start) ? start : endInit,
-      firstDate: start,
-      lastDate: DateTime(now.year + 1, 12, 31),
-    );
-    if (!mounted || end == null) return;
+    if (!mounted || selectedRange == null) return;
 
     setState(() {
-      _range = DateTimeRange(start: start, end: end);
+      _range = selectedRange;
       _latestN = null; // mode plage prend le dessus
     });
 
